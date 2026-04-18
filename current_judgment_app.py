@@ -2,28 +2,18 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
-from pathlib import Path
-import sys
 from typing import Any
 
-if __package__ in {None, ""}:
-    current_path = Path(__file__).resolve()
-    candidate_roots = [current_path.parent, *current_path.parents]
-    for candidate in candidate_roots:
-        if (candidate / "breakout_breadth").is_dir():
-            if str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-            break
-
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-
-from breakout_breadth import advanced_trade_management, config, data_provider
+import yfinance as yf
 
 
 APP_TITLE = "Swing Trade Current Judgment Dashboard"
+CACHE_TTL_SECONDS = 3600
 DEFAULT_WATCHLIST = ("SPY", "QQQ", "NVDA", "MSFT", "AAPL", "SOXX")
 DEFAULT_BREADTH_UNIVERSE = (
     "SPY",
@@ -45,7 +35,7 @@ DEFAULT_BREADTH_UNIVERSE = (
     "NOW",
     "PANW",
 )
-
+REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 REGIME_COLORS = {
     "Trend Healthy": "#15803d",
     "Overheated but Intact": "#d97706",
@@ -181,14 +171,14 @@ def build_controls() -> tuple[list[str], int, JudgmentThresholds, bool]:
     watchlist_raw = st.sidebar.text_input(
         "Watchlist tickers",
         value=", ".join(DEFAULT_WATCHLIST),
-        help="Comma-separated ticker list.",
+        help="Comma-separated ticker list",
     )
     history_years = st.sidebar.slider("History lookback (years)", min_value=1, max_value=10, value=3, step=1)
     overheat_rsi = st.sidebar.slider("Overheat RSI", min_value=60.0, max_value=85.0, value=70.0, step=1.0)
     overheat_stretch = st.sidebar.slider("Overheat stretch (ATR)", min_value=1.5, max_value=4.0, value=2.5, step=0.1)
     trend_adx = st.sidebar.slider("Trend ADX floor", min_value=15.0, max_value=40.0, value=25.0, step=1.0)
     refresh = st.sidebar.button("Refresh cached data", use_container_width=True)
-    st.sidebar.caption("Breadth context uses a fixed multi-asset swing basket and the last completed daily bar.")
+    st.sidebar.caption("Standalone app. No local package import is required.")
 
     watchlist = parse_tickers(watchlist_raw) or list(DEFAULT_WATCHLIST)
     thresholds = JudgmentThresholds(
@@ -199,56 +189,346 @@ def build_controls() -> tuple[list[str], int, JudgmentThresholds, bool]:
     return watchlist, int(history_years), thresholds, refresh
 
 
-@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+def _normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+    normalized = frame.copy()
+    normalized.index = pd.to_datetime(normalized.index)
+    normalized = normalized.sort_index()
+    if "Adj Close" in normalized.columns and "Close" not in normalized.columns:
+        normalized = normalized.rename(columns={"Adj Close": "Close"})
+    for column in REQUIRED_OHLCV_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = pd.NA
+    normalized = normalized.loc[:, list(REQUIRED_OHLCV_COLUMNS)]
+    normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"])
+    normalized["Volume"] = normalized["Volume"].fillna(0.0)
+    return normalized
+
+
+def _split_download_frame(raw: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
+    if raw is None or raw.empty:
+        return {ticker: pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)) for ticker in tickers}
+
+    frames: dict[str, pd.DataFrame] = {}
+    if isinstance(raw.columns, pd.MultiIndex):
+        tickers_in_frame = set(raw.columns.get_level_values(-1))
+        for ticker in tickers:
+            if ticker not in tickers_in_frame:
+                frames[ticker] = pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+                continue
+            frames[ticker] = _normalize_ohlcv_frame(raw.xs(ticker, axis=1, level=-1, drop_level=True))
+        return frames
+
+    if len(tickers) == 1:
+        return {tickers[0]: _normalize_ohlcv_frame(raw)}
+
+    return {ticker: pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)) for ticker in tickers}
+
+
+def download_price_history(tickers: list[str], start_date: date, end_date: date) -> dict[str, pd.DataFrame]:
+    raw = yf.download(
+        tickers,
+        start=start_date.isoformat(),
+        end=(end_date + timedelta(days=1)).isoformat(),
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+        group_by="column",
+    )
+    return _split_download_frame(raw, tickers)
+
+
+def _prepare_frame(price_df: pd.DataFrame) -> pd.DataFrame:
+    if price_df.empty:
+        return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+    frame = price_df.copy()
+    frame.index = pd.to_datetime(frame.index)
+    frame = frame.sort_index()
+    frame = frame.loc[~frame.index.duplicated(keep="last")]
+    missing = [column for column in REQUIRED_OHLCV_COLUMNS if column not in frame.columns]
+    if missing:
+        return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+    return frame.loc[:, list(REQUIRED_OHLCV_COLUMNS)].dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def _true_range(frame: pd.DataFrame) -> pd.Series:
+    prev_close = frame["Close"].shift(1)
+    return pd.concat(
+        [
+            frame["High"] - frame["Low"],
+            (frame["High"] - prev_close).abs(),
+            (frame["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+
+def _wilder_average(series: pd.Series, window: int) -> pd.Series:
+    return series.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
+
+
+def _compute_rsi(close: pd.Series, window: int) -> pd.Series:
+    delta = close.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = _wilder_average(gains, window)
+    avg_loss = _wilder_average(losses, window)
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(100.0).where(avg_gain.notna() | avg_loss.notna())
+
+
+def _compute_adx(frame: pd.DataFrame, window: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    up_move = frame["High"].diff()
+    down_move = -frame["Low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0), index=frame.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0), index=frame.index)
+    atr = _wilder_average(_true_range(frame), window)
+    plus_di = 100.0 * _wilder_average(plus_dm, window) / atr.replace(0.0, np.nan)
+    minus_di = 100.0 * _wilder_average(minus_dm, window) / atr.replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    adx = _wilder_average(dx, window)
+    return plus_di, minus_di, adx
+
+
+def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
+    x = np.arange(window, dtype=float)
+    x_centered = x - x.mean()
+    denominator = float(np.sum(x_centered**2))
+
+    def _slope(values: np.ndarray) -> float:
+        centered = values - values.mean()
+        return float(np.dot(centered, x_centered) / denominator)
+
+    return series.rolling(window).apply(_slope, raw=True)
+
+
+def _compute_macd(close: pd.Series, fast: int, slow: int, signal: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def _compute_wvf(frame: pd.DataFrame, window: int = 22, band_window: int = 20, std_multiplier: float = 2.0) -> tuple[pd.Series, pd.Series]:
+    highest_close = frame["Close"].rolling(window).max()
+    wvf = (highest_close - frame["Low"]) / highest_close.replace(0.0, np.nan) * 100.0
+    upper_band = wvf.rolling(band_window).mean() + (wvf.rolling(band_window).std() * std_multiplier)
+    spike = wvf > upper_band
+    return wvf, spike.fillna(False)
+
+
+def _compute_squeeze(
+    frame: pd.DataFrame,
+    window: int = 20,
+    bb_mult: float = 2.0,
+    kc_mult: float = 1.5,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    close = frame["Close"]
+    basis = close.rolling(window).mean()
+    deviation = close.rolling(window).std()
+    bb_upper = basis + (deviation * bb_mult)
+    bb_lower = basis - (deviation * bb_mult)
+
+    tr = _true_range(frame)
+    kc_basis = close.rolling(window).mean()
+    kc_range = tr.rolling(window).mean()
+    kc_upper = kc_basis + (kc_range * kc_mult)
+    kc_lower = kc_basis - (kc_range * kc_mult)
+    squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
+
+    highest_high = frame["High"].rolling(window).max()
+    lowest_low = frame["Low"].rolling(window).min()
+    midpoint = ((highest_high + lowest_low) / 2.0 + basis) / 2.0
+    squeeze_base = close - midpoint
+    momentum = _rolling_slope(squeeze_base, window) * window
+    return squeeze_on.fillna(False), momentum, momentum.diff()
+
+
+def _compute_supertrend(frame: pd.DataFrame, window: int = 10, multiplier: float = 3.0) -> tuple[pd.Series, pd.Series]:
+    atr = _wilder_average(_true_range(frame), window)
+    hl2 = (frame["High"] + frame["Low"]) / 2.0
+    basic_upper = hl2 + (multiplier * atr)
+    basic_lower = hl2 - (multiplier * atr)
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    supertrend = pd.Series(index=frame.index, dtype=float)
+    direction = pd.Series(index=frame.index, dtype=float)
+
+    for idx in range(len(frame)):
+        if idx == 0:
+            supertrend.iloc[idx] = np.nan
+            direction.iloc[idx] = 1.0
+            continue
+
+        prev_idx = idx - 1
+        if pd.notna(final_upper.iloc[prev_idx]):
+            if basic_upper.iloc[idx] < final_upper.iloc[prev_idx] or frame["Close"].iloc[prev_idx] > final_upper.iloc[prev_idx]:
+                final_upper.iloc[idx] = basic_upper.iloc[idx]
+            else:
+                final_upper.iloc[idx] = final_upper.iloc[prev_idx]
+        if pd.notna(final_lower.iloc[prev_idx]):
+            if basic_lower.iloc[idx] > final_lower.iloc[prev_idx] or frame["Close"].iloc[prev_idx] < final_lower.iloc[prev_idx]:
+                final_lower.iloc[idx] = basic_lower.iloc[idx]
+            else:
+                final_lower.iloc[idx] = final_lower.iloc[prev_idx]
+
+        previous_supertrend = supertrend.iloc[prev_idx]
+        if pd.isna(previous_supertrend):
+            if frame["Close"].iloc[idx] <= final_upper.iloc[idx]:
+                supertrend.iloc[idx] = final_upper.iloc[idx]
+                direction.iloc[idx] = -1.0
+            else:
+                supertrend.iloc[idx] = final_lower.iloc[idx]
+                direction.iloc[idx] = 1.0
+            continue
+
+        if previous_supertrend == final_upper.iloc[prev_idx]:
+            if frame["Close"].iloc[idx] <= final_upper.iloc[idx]:
+                supertrend.iloc[idx] = final_upper.iloc[idx]
+                direction.iloc[idx] = -1.0
+            else:
+                supertrend.iloc[idx] = final_lower.iloc[idx]
+                direction.iloc[idx] = 1.0
+        else:
+            if frame["Close"].iloc[idx] >= final_lower.iloc[idx]:
+                supertrend.iloc[idx] = final_lower.iloc[idx]
+                direction.iloc[idx] = 1.0
+            else:
+                supertrend.iloc[idx] = final_upper.iloc[idx]
+                direction.iloc[idx] = -1.0
+
+    return supertrend, direction
+
+
+def compute_market_breadth_context(price_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    usable_frames = {ticker: _prepare_frame(frame) for ticker, frame in price_frames.items() if not frame.empty}
+    if not usable_frames:
+        return pd.DataFrame(
+            columns=[
+                "AdvanceRatio",
+                "BreadthEMA",
+                "BreadthWeak",
+                "BreadthThrust",
+                "BreadthThrustActive",
+                "PctAboveEMA20",
+                "BreadthSupportive",
+            ]
+        )
+
+    close_frame = pd.concat({ticker: frame["Close"] for ticker, frame in usable_frames.items()}, axis=1).sort_index()
+    advance_ratio = close_frame.pct_change().gt(0.0).mean(axis=1)
+    breadth_ema = advance_ratio.ewm(span=10, adjust=False, min_periods=10).mean()
+    rolling_min = breadth_ema.rolling(10).min()
+    breadth_thrust = breadth_ema.ge(0.615) & rolling_min.le(0.40)
+    breadth_thrust_active = breadth_thrust.rolling(20).max().fillna(0.0).astype(bool)
+
+    ema20_panel = close_frame.rolling(20).mean()
+    pct_above_ema20 = close_frame.gt(ema20_panel).mean(axis=1)
+    breadth_weak = breadth_ema.lt(0.50) | pct_above_ema20.lt(0.50) | breadth_ema.lt(breadth_ema.shift(3))
+    breadth_supportive = breadth_thrust_active | breadth_ema.gt(0.52) | pct_above_ema20.gt(0.55)
+
+    return pd.DataFrame(
+        {
+            "AdvanceRatio": advance_ratio,
+            "BreadthEMA": breadth_ema,
+            "BreadthWeak": breadth_weak.fillna(False),
+            "BreadthThrust": breadth_thrust.fillna(False),
+            "BreadthThrustActive": breadth_thrust_active.fillna(False),
+            "PctAboveEMA20": pct_above_ema20,
+            "BreadthSupportive": breadth_supportive.fillna(False),
+        }
+    )
+
+
+def compute_indicators(price_df: pd.DataFrame) -> pd.DataFrame:
+    frame = _prepare_frame(price_df)
+    if frame.empty:
+        return frame
+
+    atr = _wilder_average(_true_range(frame), 14)
+    _, _, adx = _compute_adx(frame, 14)
+    ema = frame["Close"].ewm(span=20, adjust=False, min_periods=20).mean()
+    rsi = _compute_rsi(frame["Close"], 14)
+    chandelier_stop = frame["High"].rolling(22).max() - (atr * 3.0)
+    stretch_atr = (frame["Close"] - ema) / atr.replace(0.0, np.nan)
+    macd_line, macd_signal, macd_hist = _compute_macd(frame["Close"], 12, 26, 9)
+    wvf, wvf_spike = _compute_wvf(frame)
+    squeeze_on, squeeze_momentum, squeeze_momentum_delta = _compute_squeeze(frame)
+    elder_ema = frame["Close"].ewm(span=13, adjust=False, min_periods=13).mean()
+    elder_green = elder_ema.gt(elder_ema.shift(1)) & macd_hist.gt(macd_hist.shift(1))
+    elder_red = elder_ema.lt(elder_ema.shift(1)) & macd_hist.lt(macd_hist.shift(1))
+    supertrend, supertrend_direction = _compute_supertrend(frame)
+
+    indicator_frame = frame.copy()
+    indicator_frame["ATR"] = atr
+    indicator_frame["ADX"] = adx
+    indicator_frame["EMA"] = ema
+    indicator_frame["RSI"] = rsi
+    indicator_frame["ChandelierStop"] = chandelier_stop
+    indicator_frame["StretchATR"] = stretch_atr
+    indicator_frame["MACD"] = macd_line
+    indicator_frame["MACDSignal"] = macd_signal
+    indicator_frame["MACDHist"] = macd_hist
+    indicator_frame["MACDHistDelta"] = macd_hist.diff()
+    indicator_frame["WVF"] = wvf
+    indicator_frame["WVFSpike"] = wvf_spike
+    indicator_frame["SqueezeOn"] = squeeze_on
+    indicator_frame["SqueezeMomentum"] = squeeze_momentum
+    indicator_frame["SqueezeMomentumDelta"] = squeeze_momentum_delta
+    indicator_frame["ElderImpulseGreen"] = elder_green.fillna(False)
+    indicator_frame["ElderImpulseRed"] = elder_red.fillna(False)
+    indicator_frame["SuperTrend"] = supertrend
+    indicator_frame["SuperTrendDirection"] = supertrend_direction
+    indicator_frame["SuperTrendBull"] = supertrend_direction.gt(0.0).fillna(False)
+    indicator_frame["SuperTrendBear"] = supertrend_direction.lt(0.0).fillna(False)
+    return indicator_frame
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_dashboard_data(
     *,
     watchlist: tuple[str, ...],
     breadth_universe: tuple[str, ...],
     history_years: int,
-    provider_name: str,
-    force_refresh: bool = False,
 ) -> dict[str, Any]:
     fetch_start = date.today() - timedelta(days=(history_years * 365) + 60)
     all_tickers = tuple(sorted(set(watchlist + breadth_universe)))
-    price_frames, diagnostics = data_provider.download_ohlcv_universe(
-        list(all_tickers),
-        provider_name=provider_name,
-        start_date=fetch_start,
-        end_date=date.today(),
-        force_refresh=force_refresh,
-    )
-    params = advanced_trade_management.AdvancedTradeManagementParams()
+    price_frames = download_price_history(list(all_tickers), fetch_start, date.today())
+
     breadth_frames = {
         ticker: frame for ticker, frame in price_frames.items() if ticker in breadth_universe and not frame.empty
     }
-    breadth_context = advanced_trade_management.compute_market_breadth_context(breadth_frames, params)
+    breadth_context = compute_market_breadth_context(breadth_frames)
+
     indicator_frames: dict[str, pd.DataFrame] = {}
     for ticker in watchlist:
         frame = price_frames.get(ticker, pd.DataFrame())
         if frame.empty:
             continue
-        indicator = advanced_trade_management.compute_advanced_indicators(frame, params).join(breadth_context, how="left")
-        if "BreadthWeak" in indicator.columns:
-            indicator["BreadthWeak"] = indicator["BreadthWeak"].fillna(False)
-        else:
+        indicator = compute_indicators(frame).join(breadth_context, how="left")
+        if "BreadthWeak" not in indicator.columns:
             indicator["BreadthWeak"] = False
-        if "BreadthSupportive" in indicator.columns:
-            indicator["BreadthSupportive"] = indicator["BreadthSupportive"].fillna(False)
-        else:
+        if "BreadthSupportive" not in indicator.columns:
             indicator["BreadthSupportive"] = False
+        indicator["BreadthWeak"] = indicator["BreadthWeak"].fillna(False)
+        indicator["BreadthSupportive"] = indicator["BreadthSupportive"].fillna(False)
         indicator_frames[ticker] = indicator
 
     diagnostics_frame = pd.DataFrame(
         [
             {
-                "Provider": diagnostics.provider_name,
-                "Requested": diagnostics.requested_tickers,
-                "Returned": diagnostics.returned_tickers,
-                "Missing": len(diagnostics.missing_tickers),
-                "Batches": diagnostics.batch_count,
-                "Cache hits": diagnostics.cache_hits,
-                "Start": diagnostics.start_date or "period",
-                "End": diagnostics.end_date or diagnostics.period or "n/a",
+                "Provider": "yfinance",
+                "Requested": len(all_tickers),
+                "Returned": sum(1 for frame in price_frames.values() if not frame.empty),
+                "Missing": sum(1 for frame in price_frames.values() if frame.empty),
+                "Batches": 1,
+                "Cache hits": "cache_data",
+                "Start": fetch_start.isoformat(),
+                "End": date.today().isoformat(),
             }
         ]
     )
@@ -256,9 +536,8 @@ def load_dashboard_data(
         "price_frames": price_frames,
         "indicator_frames": indicator_frames,
         "breadth_context": breadth_context,
-        "provider_diagnostics": diagnostics,
         "provider_diagnostics_frame": diagnostics_frame,
-        "provider_name": provider_name,
+        "provider_name": "yfinance",
     }
 
 
@@ -312,6 +591,7 @@ def evaluate_current_judgment(
         bool(pd.notna(latest.get("EMA")) and latest["Close"] > latest["EMA"]),
     ]
     trend_score = int(sum(trend_flags))
+
     close_vs_stop_pct = None
     close_below_stop = False
     if pd.notna(latest.get("ChandelierStop")) and latest["ChandelierStop"] != 0:
@@ -331,6 +611,16 @@ def evaluate_current_judgment(
         rationale.append(f"ADX {_format_float(float(latest['ADX']), 1)}")
     if pd.notna(latest.get("MACDHist")):
         rationale.append(f"MACD hist {_format_float(float(latest['MACDHist']), 2)}")
+    if bool(latest.get("WVFSpike", False)):
+        rationale.append("Vix Fix stress spike")
+    if breadth_supportive:
+        rationale.append("Breadth supportive")
+    if breadth_weak:
+        rationale.append("Breadth weakening")
+    if bool(latest.get("ElderImpulseRed", False)):
+        rationale.append("Elder impulse red")
+    if bool(latest.get("SuperTrendBear", False)):
+        rationale.append("SuperTrend bearish")
 
     hold_score = 50 + (trend_score * 8) - (confirmation_count * 10) - (heat_score * 8)
     if breadth_supportive:
@@ -361,17 +651,6 @@ def evaluate_current_judgment(
 
     breadth_state = "Supportive" if breadth_supportive else "Weak" if breadth_weak else "Mixed"
     supertrend_state = "Bullish" if bool(latest.get("SuperTrendBull", False)) else "Bearish"
-
-    if bool(latest.get("WVFSpike", False)):
-        rationale.append("Vix Fix stress spike")
-    if breadth_supportive:
-        rationale.append("Breadth supportive")
-    if breadth_weak:
-        rationale.append("Breadth weakening")
-    if bool(latest.get("ElderImpulseRed", False)):
-        rationale.append("Elder impulse red")
-    if bool(latest.get("SuperTrendBear", False)):
-        rationale.append("SuperTrend bearish")
 
     return CurrentJudgment(
         ticker=ticker,
@@ -462,17 +741,12 @@ def build_price_context_figure(ticker: str, indicator_frame: pd.DataFrame, thres
         col=1,
     )
     fig.add_trace(go.Scatter(x=frame["Date"], y=frame["EMA"], name="EMA", line={"color": "#2563eb", "width": 2}), row=1, col=1)
-    fig.add_trace(
-        go.Scatter(x=frame["Date"], y=frame["SuperTrend"], name="SuperTrend", line={"color": "#15803d", "width": 2}),
-        row=1,
-        col=1,
-    )
+    fig.add_trace(go.Scatter(x=frame["Date"], y=frame["SuperTrend"], name="SuperTrend", line={"color": "#15803d", "width": 2}), row=1, col=1)
     fig.add_trace(
         go.Scatter(x=frame["Date"], y=frame["ChandelierStop"], name="Chandelier Stop", line={"color": "#dc2626", "width": 2, "dash": "dash"}),
         row=1,
         col=1,
     )
-
     fig.add_trace(
         go.Bar(
             x=frame["Date"],
@@ -483,24 +757,9 @@ def build_price_context_figure(ticker: str, indicator_frame: pd.DataFrame, thres
         row=2,
         col=1,
     )
-    fig.add_trace(
-        go.Scatter(x=frame["Date"], y=frame["SqueezeMomentum"], name="Squeeze Momentum", line={"color": "#7c3aed", "width": 2}),
-        row=2,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(x=frame["Date"], y=frame["RSI"], name="RSI", line={"color": "#0f766e", "width": 2}),
-        row=3,
-        col=1,
-        secondary_y=False,
-    )
-    fig.add_trace(
-        go.Scatter(x=frame["Date"], y=frame["StretchATR"], name="Stretch ATR", line={"color": "#ea580c", "width": 2}),
-        row=3,
-        col=1,
-        secondary_y=True,
-    )
+    fig.add_trace(go.Scatter(x=frame["Date"], y=frame["SqueezeMomentum"], name="Squeeze Momentum", line={"color": "#7c3aed", "width": 2}), row=2, col=1)
+    fig.add_trace(go.Scatter(x=frame["Date"], y=frame["RSI"], name="RSI", line={"color": "#0f766e", "width": 2}), row=3, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=frame["Date"], y=frame["StretchATR"], name="Stretch ATR", line={"color": "#ea580c", "width": 2}), row=3, col=1, secondary_y=True)
     fig.add_hline(y=thresholds.overheat_rsi, row=3, col=1, line_dash="dot", line_color="#0f766e")
     fig.add_hline(y=thresholds.overheat_stretch_atr, row=3, col=1, secondary_y=True, line_dash="dot", line_color="#ea580c")
     fig.update_layout(
@@ -521,14 +780,7 @@ def build_breadth_context_figure(breadth_context: pd.DataFrame) -> go.Figure:
     frame = breadth_context.tail(120).reset_index().rename(columns={"index": "Date"})
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=frame["Date"], y=frame["BreadthEMA"], name="Breadth EMA", line={"color": "#2563eb", "width": 3}))
-    fig.add_trace(
-        go.Scatter(
-            x=frame["Date"],
-            y=frame["PctAboveEMA20"],
-            name="% Above EMA20",
-            line={"color": "#d97706", "width": 2},
-        )
-    )
+    fig.add_trace(go.Scatter(x=frame["Date"], y=frame["PctAboveEMA20"], name="% Above EMA20", line={"color": "#d97706", "width": 2}))
     fig.add_trace(
         go.Scatter(
             x=frame.loc[frame["BreadthThrustActive"], "Date"],
@@ -551,15 +803,12 @@ def build_breadth_context_figure(breadth_context: pd.DataFrame) -> go.Figure:
 
 
 def render_header(provider_name: str, judgments: dict[str, CurrentJudgment]) -> None:
-    if judgments:
-        latest_as_of = max(item.as_of for item in judgments.values()).date().isoformat()
-    else:
-        latest_as_of = "n/a"
+    latest_as_of = max(item.as_of for item in judgments.values()).date().isoformat() if judgments else "n/a"
     st.markdown(
         f"""
         <div class="hero">
             <h1>{APP_TITLE}</h1>
-            <p>Provider: {provider_name} | Last completed daily bar: {latest_as_of} | Focus: avoid selling strong trends too early while surfacing real distribution risk.</p>
+            <p>Provider: {provider_name} | Last completed daily bar: {latest_as_of} | Standalone Streamlit app for swing-trade context and exit timing.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -587,39 +836,8 @@ def render_summary_table(judgment_frame: pd.DataFrame) -> None:
     if judgment_frame.empty:
         st.warning("No usable indicator frames were loaded for the watchlist.")
         return
-    display = judgment_frame.loc[
-        :,
-        [
-            "ticker",
-            "as_of",
-            "last_close",
-            "daily_return",
-            "regime",
-            "action",
-            "hold_score",
-            "confirmation_count",
-            "rsi",
-            "stretch_atr",
-            "adx",
-            "breadth_state",
-            "supertrend_state",
-        ],
-    ].copy()
-    display.columns = [
-        "Ticker",
-        "As Of",
-        "Close",
-        "1D Return",
-        "Regime",
-        "Action",
-        "Hold Score",
-        "Confirmations",
-        "RSI",
-        "Stretch ATR",
-        "ADX",
-        "Breadth",
-        "SuperTrend",
-    ]
+    display = judgment_frame.loc[:, ["ticker", "as_of", "last_close", "daily_return", "regime", "action", "hold_score", "confirmation_count", "rsi", "stretch_atr", "adx", "breadth_state", "supertrend_state"]].copy()
+    display.columns = ["Ticker", "As Of", "Close", "1D Return", "Regime", "Action", "Hold Score", "Confirmations", "RSI", "Stretch ATR", "ADX", "Breadth", "SuperTrend"]
     display["Close"] = display["Close"].map(_format_float)
     display["1D Return"] = display["1D Return"].map(_format_pct)
     display["RSI"] = display["RSI"].map(lambda value: _format_float(value, 1))
@@ -628,13 +846,7 @@ def render_summary_table(judgment_frame: pd.DataFrame) -> None:
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-def render_judgment_panel(
-    selected_ticker: str,
-    judgment: CurrentJudgment,
-    indicator_frame: pd.DataFrame,
-    breadth_context: pd.DataFrame,
-    thresholds: JudgmentThresholds,
-) -> None:
+def render_judgment_panel(selected_ticker: str, judgment: CurrentJudgment, indicator_frame: pd.DataFrame, breadth_context: pd.DataFrame, thresholds: JudgmentThresholds) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
     left, right = st.columns([1.6, 1.0])
     with left:
@@ -668,21 +880,16 @@ def render_judgment_panel(
 def render_diagnostics(result: dict[str, Any]) -> None:
     with st.expander("Data diagnostics", expanded=False):
         st.dataframe(result["provider_diagnostics_frame"], use_container_width=True, hide_index=True)
-        missing = list(result["provider_diagnostics"].missing_tickers[:20])
-        if missing:
-            st.warning(f"Missing OHLCV for {len(result['provider_diagnostics'].missing_tickers)} symbols. Sample: {', '.join(missing)}")
 
 
 def main() -> None:
     configure_page()
     apply_style()
     watchlist, history_years, thresholds, refresh = build_controls()
-    provider_name = data_provider.select_default_provider_name()
 
     if refresh:
         st.cache_data.clear()
-        data_provider.clear_all_caches()
-        st.sidebar.success("Caches cleared. Rerun to fetch fresh data.")
+        st.sidebar.success("Cached data cleared. Rerun to fetch fresh prices.")
 
     try:
         with st.spinner("Loading watchlist, market breadth, and current signal context..."):
@@ -690,8 +897,6 @@ def main() -> None:
                 watchlist=tuple(watchlist),
                 breadth_universe=DEFAULT_BREADTH_UNIVERSE,
                 history_years=history_years,
-                provider_name=provider_name,
-                force_refresh=False,
             )
     except Exception as exc:
         st.error("Current judgment data could not be loaded.")
@@ -699,7 +904,7 @@ def main() -> None:
         st.stop()
 
     judgment_frame, judgments = build_judgment_frame(result["indicator_frames"], thresholds)
-    render_header(provider_name, judgments)
+    render_header(result["provider_name"], judgments)
     render_kpis(judgment_frame)
     render_summary_table(judgment_frame)
 
@@ -708,13 +913,7 @@ def main() -> None:
         st.stop()
 
     selected_ticker = st.selectbox("Drill-down ticker", options=judgment_frame["ticker"].tolist(), index=0)
-    render_judgment_panel(
-        selected_ticker,
-        judgments[selected_ticker],
-        result["indicator_frames"][selected_ticker],
-        result["breadth_context"],
-        thresholds,
-    )
+    render_judgment_panel(selected_ticker, judgments[selected_ticker], result["indicator_frames"][selected_ticker], result["breadth_context"], thresholds)
     render_diagnostics(result)
 
 
