@@ -554,72 +554,73 @@ def render_metric_card(title: str, value: str, caption: str) -> None:
     )
 
 
+def _coerce_bool(value: Any) -> bool:
+    return bool(value) if pd.notna(value) else False
+
+
+def _coerce_float(value: Any) -> float | None:
+    return float(value) if pd.notna(value) else None
+
+
 def _signal_confirmation_count(row: pd.Series) -> int:
     confirmations = [
         bool(pd.notna(row.get("MACDHist")) and row["MACDHist"] < 0.0),
         bool(pd.notna(row.get("SqueezeMomentum")) and row["SqueezeMomentum"] < 0.0),
-        bool(row.get("ElderImpulseRed", False)),
-        bool(row.get("SuperTrendBear", False)),
-        bool(row.get("BreadthWeak", False)),
-        bool(row.get("WVFSpike", False)),
+        _coerce_bool(row.get("ElderImpulseRed", False)),
+        _coerce_bool(row.get("SuperTrendBear", False)),
+        _coerce_bool(row.get("BreadthWeak", False)),
+        _coerce_bool(row.get("WVFSpike", False)),
     ]
     return int(sum(confirmations))
 
 
-def evaluate_current_judgment(
-    ticker: str,
-    indicator_frame: pd.DataFrame,
-    thresholds: JudgmentThresholds,
-) -> CurrentJudgment:
-    frame = indicator_frame.dropna(subset=["Close"]).copy()
-    latest = frame.iloc[-1]
-    previous_close = frame["Close"].iloc[-2] if len(frame) > 1 else latest["Close"]
-    daily_return = float(latest["Close"] / previous_close - 1.0) if previous_close else 0.0
-    confirmation_count = _signal_confirmation_count(latest)
+def _evaluate_signal_state(row: pd.Series, thresholds: JudgmentThresholds) -> dict[str, Any]:
+    confirmation_count = _signal_confirmation_count(row)
 
     heat_flags = [
-        bool(pd.notna(latest.get("RSI")) and latest["RSI"] >= thresholds.overheat_rsi),
-        bool(pd.notna(latest.get("StretchATR")) and latest["StretchATR"] >= thresholds.overheat_stretch_atr),
+        bool(pd.notna(row.get("RSI")) and row["RSI"] >= thresholds.overheat_rsi),
+        bool(pd.notna(row.get("StretchATR")) and row["StretchATR"] >= thresholds.overheat_stretch_atr),
     ]
     heat_score = int(sum(heat_flags))
     trend_flags = [
-        bool(pd.notna(latest.get("ADX")) and latest["ADX"] >= thresholds.trend_adx),
-        bool(pd.notna(latest.get("MACDHist")) and latest["MACDHist"] > 0.0),
-        bool(latest.get("SuperTrendBull", False)),
-        bool(latest.get("ElderImpulseGreen", False)),
-        bool(latest.get("BreadthSupportive", False)),
-        bool(pd.notna(latest.get("EMA")) and latest["Close"] > latest["EMA"]),
+        bool(pd.notna(row.get("ADX")) and row["ADX"] >= thresholds.trend_adx),
+        bool(pd.notna(row.get("MACDHist")) and row["MACDHist"] > 0.0),
+        _coerce_bool(row.get("SuperTrendBull", False)),
+        _coerce_bool(row.get("ElderImpulseGreen", False)),
+        _coerce_bool(row.get("BreadthSupportive", False)),
+        bool(pd.notna(row.get("EMA")) and row["Close"] > row["EMA"]),
     ]
     trend_score = int(sum(trend_flags))
 
     close_vs_stop_pct = None
     close_below_stop = False
-    if pd.notna(latest.get("ChandelierStop")) and latest["ChandelierStop"] != 0:
-        close_vs_stop_pct = float(latest["Close"] / latest["ChandelierStop"] - 1.0)
-        close_below_stop = latest["Close"] <= latest["ChandelierStop"]
+    if pd.notna(row.get("ChandelierStop")) and row["ChandelierStop"] != 0:
+        close_vs_stop_pct = float(row["Close"] / row["ChandelierStop"] - 1.0)
+        close_below_stop = row["Close"] <= row["ChandelierStop"]
 
-    breadth_supportive = bool(latest.get("BreadthSupportive", False))
-    breadth_weak = bool(latest.get("BreadthWeak", False))
-    supertrend_bear = bool(latest.get("SuperTrendBear", False))
+    breadth_supportive = _coerce_bool(row.get("BreadthSupportive", False))
+    breadth_weak = _coerce_bool(row.get("BreadthWeak", False))
+    supertrend_bull = _coerce_bool(row.get("SuperTrendBull", False))
+    supertrend_bear = _coerce_bool(row.get("SuperTrendBear", False))
 
     rationale: list[str] = []
-    if pd.notna(latest.get("RSI")):
-        rationale.append(f"RSI {_format_float(float(latest['RSI']), 1)}")
-    if pd.notna(latest.get("StretchATR")):
-        rationale.append(f"Stretch {_format_float(float(latest['StretchATR']), 2)} ATR")
-    if pd.notna(latest.get("ADX")):
-        rationale.append(f"ADX {_format_float(float(latest['ADX']), 1)}")
-    if pd.notna(latest.get("MACDHist")):
-        rationale.append(f"MACD hist {_format_float(float(latest['MACDHist']), 2)}")
-    if bool(latest.get("WVFSpike", False)):
+    if pd.notna(row.get("RSI")):
+        rationale.append(f"RSI {_format_float(float(row['RSI']), 1)}")
+    if pd.notna(row.get("StretchATR")):
+        rationale.append(f"Stretch {_format_float(float(row['StretchATR']), 2)} ATR")
+    if pd.notna(row.get("ADX")):
+        rationale.append(f"ADX {_format_float(float(row['ADX']), 1)}")
+    if pd.notna(row.get("MACDHist")):
+        rationale.append(f"MACD hist {_format_float(float(row['MACDHist']), 2)}")
+    if _coerce_bool(row.get("WVFSpike", False)):
         rationale.append("Vix Fix stress spike")
     if breadth_supportive:
         rationale.append("Breadth supportive")
     if breadth_weak:
         rationale.append("Breadth weakening")
-    if bool(latest.get("ElderImpulseRed", False)):
+    if _coerce_bool(row.get("ElderImpulseRed", False)):
         rationale.append("Elder impulse red")
-    if bool(latest.get("SuperTrendBear", False)):
+    if supertrend_bear:
         rationale.append("SuperTrend bearish")
 
     hold_score = 50 + (trend_score * 8) - (confirmation_count * 10) - (heat_score * 8)
@@ -633,7 +634,7 @@ def evaluate_current_judgment(
         regime = "Exit / Defensive"
         action = "Tighten aggressively or exit."
     elif heat_score == 2 and confirmation_count >= thresholds.scale_out_confirmation_count:
-        if breadth_supportive and bool(latest.get("SuperTrendBull", False)):
+        if breadth_supportive and supertrend_bull:
             regime = "Overheated but Intact"
             action = "Trim partial only and keep the core trend."
         else:
@@ -650,29 +651,54 @@ def evaluate_current_judgment(
         action = "No edge shift yet. Keep stops updated and wait."
 
     breadth_state = "Supportive" if breadth_supportive else "Weak" if breadth_weak else "Mixed"
-    supertrend_state = "Bullish" if bool(latest.get("SuperTrendBull", False)) else "Bearish"
+    supertrend_state = "Bullish" if supertrend_bull else "Bearish"
+    return {
+        "regime": regime,
+        "action": action,
+        "hold_score": hold_score,
+        "trend_score": trend_score,
+        "heat_score": heat_score,
+        "confirmation_count": confirmation_count,
+        "breadth_state": breadth_state,
+        "supertrend_state": supertrend_state,
+        "close_vs_stop_pct": close_vs_stop_pct,
+        "close_below_stop": close_below_stop,
+        "rationale": tuple(rationale[:8]),
+    }
+
+
+def evaluate_current_judgment(
+    ticker: str,
+    indicator_frame: pd.DataFrame,
+    thresholds: JudgmentThresholds,
+) -> CurrentJudgment:
+    frame = indicator_frame.dropna(subset=["Close"]).copy()
+    latest = frame.iloc[-1]
+    previous_close = frame["Close"].iloc[-2] if len(frame) > 1 else latest["Close"]
+    daily_return = float(latest["Close"] / previous_close - 1.0) if previous_close else 0.0
+    state = _evaluate_signal_state(latest, thresholds)
 
     return CurrentJudgment(
         ticker=ticker,
         as_of=pd.Timestamp(frame.index[-1]),
         last_close=float(latest["Close"]),
         daily_return=daily_return,
-        regime=regime,
-        action=action,
-        hold_score=hold_score,
-        trend_score=trend_score,
-        heat_score=heat_score,
-        confirmation_count=confirmation_count,
-        breadth_state=breadth_state,
-        supertrend_state=supertrend_state,
-        rsi=float(latest["RSI"]) if pd.notna(latest.get("RSI")) else None,
-        stretch_atr=float(latest["StretchATR"]) if pd.notna(latest.get("StretchATR")) else None,
-        adx=float(latest["ADX"]) if pd.notna(latest.get("ADX")) else None,
-        macd_hist=float(latest["MACDHist"]) if pd.notna(latest.get("MACDHist")) else None,
-        squeeze_momentum=float(latest["SqueezeMomentum"]) if pd.notna(latest.get("SqueezeMomentum")) else None,
-        wvf=float(latest["WVF"]) if pd.notna(latest.get("WVF")) else None,
-        close_vs_stop_pct=close_vs_stop_pct,
-        rationale=tuple(rationale[:8]),
+        regime=state["regime"],
+        action=state["action"],
+        hold_score=state["hold_score"],
+        trend_score=state["trend_score"],
+        heat_score=state["heat_score"],
+        confirmation_count=state["confirmation_count"],
+        breadth_state=state["breadth_state"],
+        supertrend_state=state["supertrend_state"],
+        rsi=_coerce_float(latest.get("RSI")),
+        stretch_atr=_coerce_float(latest.get("StretchATR")),
+        adx=_coerce_float(latest.get("ADX")),
+        macd_hist=_coerce_float(latest.get("MACDHist")),
+        squeeze_momentum=_coerce_float(latest.get("SqueezeMomentum")),
+        wvf=_coerce_float(latest.get("WVF")),
+        close_vs_stop_pct=state["close_vs_stop_pct"],
+        rationale=state["rationale"],
     )
 
 
@@ -694,6 +720,215 @@ def build_judgment_frame(
 
     table = pd.DataFrame([asdict(item) for item in judgments]).sort_values(["hold_score", "ticker"], ascending=[True, True])
     return table, by_ticker
+
+
+def build_signal_state_frame(indicator_frame: pd.DataFrame, thresholds: JudgmentThresholds) -> pd.DataFrame:
+    frame = indicator_frame.dropna(subset=["Close"]).copy()
+    if frame.empty:
+        return frame
+
+    state_rows: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        state = _evaluate_signal_state(row, thresholds)
+        state_rows.append(
+            {
+                "SignalRegime": state["regime"],
+                "SignalAction": state["action"],
+                "HoldScore": state["hold_score"],
+                "TrendScore": state["trend_score"],
+                "HeatScore": state["heat_score"],
+                "ConfirmationCount": state["confirmation_count"],
+                "BreadthState": state["breadth_state"],
+                "SuperTrendState": state["supertrend_state"],
+                "CloseVsStopPct": state["close_vs_stop_pct"],
+                "RationaleText": " | ".join(state["rationale"]),
+            }
+        )
+
+    state_frame = pd.DataFrame(state_rows, index=frame.index)
+    return frame.join(state_frame, how="left")
+
+
+def _signal_reason(row: pd.Series, signal: str) -> str:
+    if signal == "BUY":
+        return (
+            f"{row['SignalRegime']} | hold {int(row['HoldScore'])} | "
+            f"trend {int(row['TrendScore'])} / confirm {int(row['ConfirmationCount'])}"
+        )
+    if signal == "PARTIAL SELL":
+        return (
+            f"{row['SignalRegime']} | heat {int(row['HeatScore'])} | "
+            f"RSI {_format_float(_coerce_float(row.get('RSI')), 1)} | "
+            f"stretch {_format_float(_coerce_float(row.get('StretchATR')), 2)} ATR"
+        )
+    return (
+        f"{row['SignalRegime']} | confirm {int(row['ConfirmationCount'])} | "
+        f"close vs stop {_format_pct(_coerce_float(row.get('CloseVsStopPct')))}"
+    )
+
+
+def build_trade_replay(
+    ticker: str,
+    indicator_frame: pd.DataFrame,
+    thresholds: JudgmentThresholds,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int | str | None], pd.DataFrame]:
+    state_frame = build_signal_state_frame(indicator_frame, thresholds)
+    if state_frame.empty:
+        empty_summary: dict[str, float | int | str | None] = {
+            "closed_trades": 0,
+            "win_rate": None,
+            "avg_closed_return": None,
+            "median_closed_return": None,
+            "avg_hold_days": None,
+            "open_trade_return": None,
+        }
+        return state_frame, pd.DataFrame(), pd.DataFrame(), empty_summary
+
+    events: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
+    in_position = False
+    partial_taken = False
+    trade_id = 0
+    entry_date: pd.Timestamp | None = None
+    entry_price: float | None = None
+    position_remaining = 0.0
+    weighted_return = 0.0
+    previous_regime: str | None = None
+
+    for timestamp, row in state_frame.iterrows():
+        regime = str(row["SignalRegime"])
+        price = float(row["Close"])
+        favorable_regimes = {"Trend Healthy", "Overheated but Intact"}
+
+        if in_position and regime == "Trend Healthy" and int(row["HeatScore"]) == 0 and int(row["ConfirmationCount"]) <= 1:
+            partial_taken = False
+
+        buy_ready = (not in_position) and regime in favorable_regimes and previous_regime not in favorable_regimes
+        partial_ready = (
+            in_position
+            and not partial_taken
+            and (
+                (regime == "Scale Out / Warning" and previous_regime != "Scale Out / Warning")
+                or (
+                    regime == "Overheated but Intact"
+                    and int(row["HeatScore"]) >= 2
+                    and int(row["ConfirmationCount"]) >= thresholds.scale_out_confirmation_count
+                    and previous_regime != "Overheated but Intact"
+                )
+            )
+        )
+        sell_ready = in_position and regime == "Exit / Defensive" and previous_regime != "Exit / Defensive"
+
+        if buy_ready:
+            trade_id += 1
+            in_position = True
+            partial_taken = False
+            entry_date = pd.Timestamp(timestamp)
+            entry_price = price
+            position_remaining = 1.0
+            weighted_return = 0.0
+            events.append(
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Date": pd.Timestamp(timestamp),
+                    "Signal": "BUY",
+                    "Price": price,
+                    "Regime": regime,
+                    "HoldScore": int(row["HoldScore"]),
+                    "PositionAfter": position_remaining,
+                    "Reason": _signal_reason(row, "BUY"),
+                }
+            )
+        elif partial_ready and entry_price is not None and position_remaining > 0.0:
+            sell_weight = 0.5 if position_remaining > 0.5 else position_remaining
+            weighted_return += sell_weight * (price / entry_price - 1.0)
+            position_remaining -= sell_weight
+            partial_taken = position_remaining > 0.0
+            events.append(
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Date": pd.Timestamp(timestamp),
+                    "Signal": "PARTIAL SELL",
+                    "Price": price,
+                    "Regime": regime,
+                    "HoldScore": int(row["HoldScore"]),
+                    "PositionAfter": position_remaining,
+                    "Reason": _signal_reason(row, "PARTIAL SELL"),
+                }
+            )
+        elif sell_ready and entry_price is not None and entry_date is not None and position_remaining > 0.0:
+            weighted_return += position_remaining * (price / entry_price - 1.0)
+            events.append(
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Date": pd.Timestamp(timestamp),
+                    "Signal": "SELL",
+                    "Price": price,
+                    "Regime": regime,
+                    "HoldScore": int(row["HoldScore"]),
+                    "PositionAfter": 0.0,
+                    "Reason": _signal_reason(row, "SELL"),
+                }
+            )
+            trades.append(
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Status": "Closed",
+                    "EntryDate": entry_date,
+                    "ExitDate": pd.Timestamp(timestamp),
+                    "EntryPrice": entry_price,
+                    "ExitPrice": price,
+                    "Return": weighted_return,
+                    "HoldDays": int((pd.Timestamp(timestamp) - entry_date).days),
+                    "PartialScaledOut": "Yes" if partial_taken else "No",
+                }
+            )
+            in_position = False
+            partial_taken = False
+            entry_date = None
+            entry_price = None
+            position_remaining = 0.0
+            weighted_return = 0.0
+
+        previous_regime = regime
+
+    if in_position and entry_price is not None and entry_date is not None:
+        last_timestamp = pd.Timestamp(state_frame.index[-1])
+        last_price = float(state_frame["Close"].iloc[-1])
+        open_return = weighted_return + (position_remaining * (last_price / entry_price - 1.0))
+        trades.append(
+            {
+                "Ticker": ticker,
+                "Trade": trade_id,
+                "Status": "Open",
+                "EntryDate": entry_date,
+                "ExitDate": last_timestamp,
+                "EntryPrice": entry_price,
+                "ExitPrice": last_price,
+                "Return": open_return,
+                "HoldDays": int((last_timestamp - entry_date).days),
+                "PartialScaledOut": "Yes" if partial_taken else "No",
+            }
+        )
+
+    event_frame = pd.DataFrame(events)
+    trade_frame = pd.DataFrame(trades)
+    closed_trades = trade_frame.loc[trade_frame["Status"] == "Closed"].copy() if not trade_frame.empty else pd.DataFrame()
+    open_trades = trade_frame.loc[trade_frame["Status"] == "Open"].copy() if not trade_frame.empty else pd.DataFrame()
+
+    summary: dict[str, float | int | str | None] = {
+        "closed_trades": int(len(closed_trades)),
+        "win_rate": float(closed_trades["Return"].gt(0.0).mean()) if not closed_trades.empty else None,
+        "avg_closed_return": float(closed_trades["Return"].mean()) if not closed_trades.empty else None,
+        "median_closed_return": float(closed_trades["Return"].median()) if not closed_trades.empty else None,
+        "avg_hold_days": float(closed_trades["HoldDays"].mean()) if not closed_trades.empty else None,
+        "open_trade_return": float(open_trades["Return"].iloc[-1]) if not open_trades.empty else None,
+    }
+    return state_frame, event_frame, trade_frame, summary
 
 
 def build_regime_gauge(judgment: CurrentJudgment) -> go.Figure:
@@ -718,8 +953,13 @@ def build_regime_gauge(judgment: CurrentJudgment) -> go.Figure:
     return fig
 
 
-def build_price_context_figure(ticker: str, indicator_frame: pd.DataFrame, thresholds: JudgmentThresholds) -> go.Figure:
-    frame = indicator_frame.tail(120).copy().reset_index().rename(columns={"index": "Date"})
+def build_price_context_figure(
+    ticker: str,
+    indicator_frame: pd.DataFrame,
+    thresholds: JudgmentThresholds,
+    signal_events: pd.DataFrame | None = None,
+) -> go.Figure:
+    frame = indicator_frame.copy().reset_index().rename(columns={"index": "Date"})
     fig = make_subplots(
         rows=3,
         cols=1,
@@ -747,6 +987,35 @@ def build_price_context_figure(ticker: str, indicator_frame: pd.DataFrame, thres
         row=1,
         col=1,
     )
+    if signal_events is not None and not signal_events.empty:
+        visible_events = signal_events.loc[signal_events["Date"].ge(frame["Date"].min())].copy()
+        marker_styles = {
+            "BUY": {"color": "#16a34a", "symbol": "triangle-up", "textposition": "bottom center"},
+            "PARTIAL SELL": {"color": "#d97706", "symbol": "diamond", "textposition": "top center"},
+            "SELL": {"color": "#dc2626", "symbol": "triangle-down", "textposition": "top center"},
+        }
+        for signal, marker in marker_styles.items():
+            subset = visible_events.loc[visible_events["Signal"] == signal]
+            if subset.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=subset["Date"],
+                    y=subset["Price"],
+                    mode="markers+text",
+                    text=subset["Signal"],
+                    textposition=marker["textposition"],
+                    name=signal,
+                    marker={"size": 12, "color": marker["color"], "symbol": marker["symbol"], "line": {"width": 1, "color": "#ffffff"}},
+                    customdata=subset[["Reason", "Regime"]],
+                    hovertemplate=(
+                        "%{x|%Y-%m-%d}<br>Price %{y:.2f}<br>%{customdata[1]}"
+                        "<br>%{customdata[0]}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
     fig.add_trace(
         go.Bar(
             x=frame["Date"],
@@ -846,11 +1115,75 @@ def render_summary_table(judgment_frame: pd.DataFrame) -> None:
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
+def render_signal_review(
+    event_frame: pd.DataFrame,
+    trade_frame: pd.DataFrame,
+    summary: dict[str, float | int | str | None],
+) -> None:
+    st.markdown('<div class="section-label">Historical Signal Replay</div>', unsafe_allow_html=True)
+    st.caption(
+        "The markers below replay the same judgment rules through history. "
+        "They are a rule-based approximation for timing review, not a broker-grade fill simulation."
+    )
+
+    avg_hold_days = "n/a" if summary["avg_hold_days"] is None else f"{summary['avg_hold_days']:.0f}d"
+    cards = st.columns(6)
+    with cards[0]:
+        render_metric_card("Closed Trades", str(summary["closed_trades"]), "Completed round trips")
+    with cards[1]:
+        render_metric_card("Win Rate", _format_pct(summary["win_rate"]), "Closed trades only")
+    with cards[2]:
+        render_metric_card("Avg Closed Return", _format_pct(summary["avg_closed_return"]), "Weighted by partial exits")
+    with cards[3]:
+        render_metric_card("Median Return", _format_pct(summary["median_closed_return"]), "Closed trades only")
+    with cards[4]:
+        render_metric_card("Avg Hold", avg_hold_days, "Closed trades only")
+    with cards[5]:
+        open_caption = "No active simulated position" if summary["open_trade_return"] is None else "Current mark-to-market"
+        render_metric_card("Open Trade", _format_pct(summary["open_trade_return"]), open_caption)
+
+    left, right = st.columns([1.2, 1.0])
+    with left:
+        if event_frame.empty:
+            st.info("No historical signal events were generated for the selected ticker.")
+        else:
+            recent_events = event_frame.sort_values("Date", ascending=False).copy()
+            recent_events["Date"] = recent_events["Date"].dt.date
+            recent_events["Price"] = recent_events["Price"].map(_format_float)
+            recent_events["PositionAfter"] = recent_events["PositionAfter"].map(lambda value: f"{value:.2f}x")
+            st.dataframe(
+                recent_events.loc[:, ["Date", "Signal", "Price", "Regime", "HoldScore", "PositionAfter", "Reason"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+    with right:
+        if trade_frame.empty:
+            st.info("No simulated trades to summarize yet.")
+        else:
+            display = trade_frame.sort_values(["EntryDate", "Trade"], ascending=[False, False]).copy()
+            display["EntryDate"] = display["EntryDate"].dt.date
+            display["ExitDate"] = display["ExitDate"].dt.date
+            display["EntryPrice"] = display["EntryPrice"].map(_format_float)
+            display["ExitPrice"] = display["ExitPrice"].map(_format_float)
+            display["Return"] = display["Return"].map(_format_pct)
+            display["HoldDays"] = display["HoldDays"].map(lambda value: f"{int(value)}d")
+            st.dataframe(
+                display.loc[:, ["Trade", "Status", "EntryDate", "ExitDate", "EntryPrice", "ExitPrice", "Return", "HoldDays", "PartialScaledOut"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
 def render_judgment_panel(selected_ticker: str, judgment: CurrentJudgment, indicator_frame: pd.DataFrame, breadth_context: pd.DataFrame, thresholds: JudgmentThresholds) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
+    signal_state_frame, signal_events, trade_frame, replay_summary = build_trade_replay(selected_ticker, indicator_frame, thresholds)
     left, right = st.columns([1.6, 1.0])
     with left:
-        st.plotly_chart(build_price_context_figure(selected_ticker, indicator_frame, thresholds), use_container_width=True, config={"displaylogo": False})
+        st.plotly_chart(
+            build_price_context_figure(selected_ticker, signal_state_frame, thresholds, signal_events),
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
     with right:
         st.plotly_chart(build_regime_gauge(judgment), use_container_width=True, config={"displaylogo": False})
         st.plotly_chart(build_breadth_context_figure(breadth_context), use_container_width=True, config={"displaylogo": False})
@@ -875,6 +1208,7 @@ def render_judgment_panel(selected_ticker: str, judgment: CurrentJudgment, indic
         ]
     )
     st.dataframe(detail, use_container_width=True, hide_index=True)
+    render_signal_review(signal_events, trade_frame, replay_summary)
 
 
 def render_diagnostics(result: dict[str, Any]) -> None:
