@@ -7,7 +7,13 @@ import sys
 from typing import Any
 
 if __package__ in {None, ""}:
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    current_path = Path(__file__).resolve()
+    candidate_roots = [current_path.parent, *current_path.parents]
+    for candidate in candidate_roots:
+        if (candidate / "breakout_breadth").is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            break
 
 import pandas as pd
 import plotly.graph_objects as go
