@@ -33,7 +33,7 @@ OPTIMIZED_TICKERS = ("SPY", "QQQ", "069500.KS")
 OPTIMIZED_TICKER_SET = set(OPTIMIZED_TICKERS)
 DEFAULT_WATCHLIST = OPTIMIZED_TICKERS
 REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
-MACRO_TICKERS = ("SPY", "^VIX", "HYG", "IEF", "RSP", "XLY", "XLP", "UUP")
+MACRO_TICKERS = ("SPY", "^VIX", "HYG", "IEF", "RSP", "XLY", "XLP", "UUP", "TIPS")
 KOREAN_TICKER_PATTERN = re.compile(r"^(?P<code>\d{6})(?:\.(?P<suffix>KS|KQ))?$", re.IGNORECASE)
 STATE_COLORS = {
     "Strong Buy": "#15803d",
@@ -118,6 +118,14 @@ PROFILE_PRESETS = {
 }
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def preset_min_hold_bars(preset: SignalPreset) -> int:
+    return max(2, preset.cooldown_bars - 1)
+
+
+def preset_reentry_lock_bars(preset: SignalPreset) -> int:
+    return max(1, preset.cooldown_bars // 2)
 
 
 def configure_page() -> None:
@@ -236,6 +244,98 @@ def _format_score(value: float | None) -> str:
     return f"{value:.0f}"
 
 
+def format_snapshot_label(snapshot: TickerSnapshot) -> str:
+    resolved = (snapshot.resolved_symbol or "").strip()
+    if not resolved or resolved == snapshot.ticker:
+        return snapshot.ticker
+    return f"{snapshot.ticker} ({resolved})"
+
+
+def compute_stop_breach_metrics(
+    close_value: float | None,
+    stop_value: float | None,
+    atr_value: float | None,
+) -> tuple[bool, float | None, float | None]:
+    if (
+        close_value is None
+        or stop_value is None
+        or pd.isna(close_value)
+        or pd.isna(stop_value)
+        or stop_value <= 0
+    ):
+        return False, None, None
+
+    close_breach = close_value <= stop_value
+    breach_pct = max(0.0, (stop_value - close_value) / stop_value) if close_breach else 0.0
+    if atr_value is None or pd.isna(atr_value) or atr_value <= 0:
+        breach_atr = None
+    else:
+        breach_atr = max(0.0, (stop_value - close_value) / atr_value) if close_breach else 0.0
+    return close_breach, breach_pct, breach_atr
+
+
+def evaluate_stop_exit(
+    close_value: float | None,
+    stop_value: float | None,
+    atr_value: float | None,
+    sell_score: int,
+    buy_score: int,
+    bearish_context: bool,
+    sell_context: bool,
+    hold_lock_active: bool = False,
+    macro_risk_off: bool = False,
+) -> tuple[bool, bool, float | None]:
+    close_breach, breach_pct, breach_atr = compute_stop_breach_metrics(close_value, stop_value, atr_value)
+    if not close_breach:
+        return False, False, breach_atr
+
+    soft_atr = 0.25 if not hold_lock_active else 0.55
+    hard_atr = 0.55 if not hold_lock_active else 0.90
+    soft_pct = 0.0015 if not hold_lock_active else 0.0040
+    hard_pct = 0.0040 if not hold_lock_active else 0.0075
+    score_gap = 6 if not hold_lock_active else 10
+    hard_score_gap = 12 if not hold_lock_active else 18
+    if macro_risk_off:
+        soft_atr *= 0.85
+        hard_atr *= 0.85
+        soft_pct *= 0.85
+        hard_pct *= 0.85
+        score_gap = max(3, score_gap - 1)
+        hard_score_gap = max(8, hard_score_gap - 2)
+
+    soft_breach = bool(
+        (breach_pct is not None and breach_pct >= soft_pct)
+        or (breach_atr is not None and breach_atr >= soft_atr)
+    )
+    hard_breach = bool(
+        (breach_pct is not None and breach_pct >= hard_pct)
+        or (breach_atr is not None and breach_atr >= hard_atr)
+    )
+    score_confirm = sell_score >= (buy_score + score_gap)
+    score_emergency = sell_score >= (buy_score + hard_score_gap)
+
+    emergency_exit = bool(hard_breach or score_emergency)
+    confirmed_exit = bool(
+        emergency_exit
+        or (
+            soft_breach
+            and (sell_context or bearish_context or score_confirm)
+        )
+    )
+    return confirmed_exit, emergency_exit, breach_atr
+
+
+def calc_13612w_momentum(series: pd.Series) -> pd.Series:
+    series = pd.to_numeric(series, errors="coerce")
+    momentum = (
+        12.0 * (series / series.shift(5) - 1.0)
+        + 4.0 * (series / series.shift(15) - 1.0)
+        + 2.0 * (series / series.shift(30) - 1.0)
+        + 1.0 * (series / series.shift(60) - 1.0)
+    )
+    return momentum.replace([np.inf, -np.inf], np.nan)
+
+
 def build_controls() -> tuple[list[str], int, SignalPreset, bool]:
     st.sidebar.subheader("Dashboard Controls")
     watchlist_raw = st.sidebar.text_area(
@@ -263,6 +363,19 @@ def normalize_datetime_index(index: Any) -> pd.DatetimeIndex:
             normalized = normalized.tz_localize(None)
         return normalized
     return pd.DatetimeIndex(normalized)
+
+
+def align_series_to_target_index(series: pd.Series, target_index: pd.Index) -> pd.Series:
+    normalized_target = normalize_datetime_index(target_index)
+    if series is None or series.empty:
+        return pd.Series(np.nan, index=normalized_target, dtype=float)
+
+    aligned = pd.to_numeric(series, errors="coerce").copy()
+    aligned.index = normalize_datetime_index(aligned.index).normalize()
+    aligned = aligned[~aligned.index.duplicated(keep="last")].sort_index()
+    target_dates = normalized_target.normalize()
+    mapped = aligned.reindex(target_dates).ffill().bfill()
+    return pd.Series(mapped.to_numpy(dtype=float), index=normalized_target, name=series.name)
 
 
 def _select_single_ticker_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -458,9 +571,12 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
         if close_panel.dropna(how="all").empty:
             score_index = pd.date_range(end=end_ts, periods=260, freq="B")
             neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
+            tips_series = pd.Series(dtype=float, name="TIPS13612W")
             return {
                 "score_series": neutral_series,
                 "benchmark_close": pd.Series(dtype=float, name="SPY"),
+                "tips_13612w_momentum": tips_series,
+                "latest_tips_13612w_momentum": None,
                 "plot_df": pd.DataFrame({"Score": neutral_series}),
                 "latest_score": 50.0,
                 "latest_label": "Neutral",
@@ -473,9 +589,12 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
         if close_panel.dropna(how="all").empty:
             score_index = pd.date_range(end=end_ts, periods=260, freq="B")
             neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
+            tips_series = pd.Series(dtype=float, name="TIPS13612W")
             return {
                 "score_series": neutral_series,
                 "benchmark_close": pd.Series(dtype=float, name="SPY"),
+                "tips_13612w_momentum": tips_series,
+                "latest_tips_13612w_momentum": None,
                 "plot_df": pd.DataFrame({"Score": neutral_series}),
                 "latest_score": 50.0,
                 "latest_label": "Neutral",
@@ -486,9 +605,14 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
     score_series, latest_factors, plot_df = compute_macro_fear_greed(close_panel)
     latest_score = float(score_series.dropna().iloc[-1]) if not score_series.dropna().empty else 50.0
     latest_label = classify_fear_greed(latest_score)
+    tips_close = close_panel["TIPS"].copy() if "TIPS" in close_panel.columns else pd.Series(dtype=float, name="TIPS")
+    tips_momentum = calc_13612w_momentum(tips_close).rename("TIPS13612W") if not tips_close.empty else pd.Series(dtype=float, name="TIPS13612W")
+    latest_tips = float(tips_momentum.dropna().iloc[-1]) if not tips_momentum.dropna().empty else None
     return {
         "score_series": score_series,
         "benchmark_close": close_panel["SPY"].copy() if "SPY" in close_panel.columns else pd.Series(dtype=float, name="SPY"),
+        "tips_13612w_momentum": tips_momentum,
+        "latest_tips_13612w_momentum": latest_tips,
         "plot_df": plot_df,
         "latest_score": latest_score,
         "latest_label": latest_label,
@@ -780,6 +904,7 @@ def compute_indicators(
     price_df: pd.DataFrame,
     macro_score_series: pd.Series | None,
     benchmark_close_series: pd.Series | None = None,
+    tips_momentum_series: pd.Series | None = None,
     asset_symbol: str | None = None,
 ) -> pd.DataFrame:
     frame = normalize_ohlcv_frame(price_df)
@@ -832,7 +957,7 @@ def compute_indicators(
         work["RSMomentum63"] = np.nan
         work["RSPercentile"] = np.nan
     else:
-        benchmark_close = pd.to_numeric(benchmark_close_series, errors="coerce").reindex(work.index).ffill().bfill()
+        benchmark_close = align_series_to_target_index(benchmark_close_series, work.index)
         relative_strength = work["Close"] / benchmark_close.replace(0.0, np.nan)
         work["RelativeStrength"] = relative_strength
         work["RSMomentum63"] = relative_strength / relative_strength.shift(63) - 1.0
@@ -841,8 +966,15 @@ def compute_indicators(
     if macro_score_series is None or macro_score_series.empty:
         work["FearGreed"] = 50.0
     else:
-        aligned = pd.to_numeric(macro_score_series, errors="coerce").reindex(work.index).ffill().bfill()
+        aligned = align_series_to_target_index(macro_score_series, work.index)
         work["FearGreed"] = aligned.fillna(50.0)
+    if tips_momentum_series is None or tips_momentum_series.empty:
+        work["TIPS13612WMomentum"] = np.nan
+        work["TIPSRiskOff"] = False
+    else:
+        aligned_tips = align_series_to_target_index(tips_momentum_series, work.index)
+        work["TIPS13612WMomentum"] = aligned_tips
+        work["TIPSRiskOff"] = aligned_tips.lt(0.0).fillna(False)
     return work
 
 
@@ -914,6 +1046,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     mfi = _coerce_float(row.get("MFI"))
     mfi_change = _coerce_float(row.get("MFIChange5"))
     fear_greed = _coerce_float(row.get("FearGreed"))
+    tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
     rs_percentile = _coerce_float(row.get("RSPercentile"))
     rs_momentum = _coerce_float(row.get("RSMomentum63"))
     volume_ratio = _coerce_float(row.get("VolumeRatio20"))
@@ -934,6 +1067,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         (rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
         or (rs_momentum is not None and rs_momentum >= (-0.03 if reference_asset else -0.01))
     )
+    tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
 
     reversion_score = 0.0
     if cycle_score is not None:
@@ -1032,6 +1166,15 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif fear_greed <= 45:
             context_score += 4
             reasons.append("Macro risk reset")
+    if tips_risk_off:
+        if deep_reversal:
+            context_score -= 2
+        elif tips_momentum is not None and tips_momentum <= -0.03:
+            context_score -= 8
+            reasons.append("TIPS 13612W risk-off")
+        else:
+            context_score -= 5
+            reasons.append("TIPS macro headwind")
 
     if relative_support:
         context_score += 8 if rs_percentile is not None and rs_percentile >= 60 else 5
@@ -1116,6 +1259,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     mfi = _coerce_float(row.get("MFI"))
     mfi_change = _coerce_float(row.get("MFIChange5"))
     fear_greed = _coerce_float(row.get("FearGreed"))
+    tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
     rs_percentile = _coerce_float(row.get("RSPercentile"))
     rs_momentum = _coerce_float(row.get("RSMomentum63"))
     volume_ratio = _coerce_float(row.get("VolumeRatio20"))
@@ -1125,6 +1269,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
     stop_touched = _coerce_bool(row.get("StopTouched"))
+    stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
     sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
     panic_low = bool(
         cycle_score is not None
@@ -1134,6 +1279,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             or (cycle_score <= 25 and rsi <= 35)
         )
     )
+    tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
 
     exhaustion_score = 0.0
     if cycle_score is not None:
@@ -1221,6 +1367,13 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif fear_greed >= 60:
             distribution_score += 4
             reasons.append("Macro greed warning")
+    if tips_risk_off:
+        if tips_momentum is not None and tips_momentum <= -0.03:
+            distribution_score += 8
+            reasons.append("TIPS 13612W negative")
+        else:
+            distribution_score += 5
+            reasons.append("TIPS risk-off backdrop")
     if rs_percentile is not None and rs_percentile <= 25:
         distribution_score += 8
         reasons.append("Relative strength breakdown")
@@ -1238,9 +1391,12 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     if sell_trigger_price:
         distribution_score += 12
         reasons.append("Price breakdown")
-    if stop_touched:
-        distribution_score += 8 if reference_asset and panic_low else 18
-        reasons.append("Trailing stop touched")
+    if stop_close_breach:
+        distribution_score += 10 if reference_asset and panic_low else 16
+        reasons.append("Trailing stop close breach")
+    elif stop_touched:
+        distribution_score += 4
+        reasons.append("Intraday stop probe")
     if bear_regime:
         distribution_score += 12
         reasons.append("Bear regime pressure")
@@ -1253,7 +1409,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             heat_signal,
             distribution_flow,
             sell_trigger_price,
-            stop_touched,
+            stop_close_breach,
             bear_regime,
         ]
     ))
@@ -1262,13 +1418,13 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         score += confluence_bonus
         reasons.append(f"{confluence_count}x sell confluence")
 
-    if bull_regime and not stop_touched and not sell_trigger_price:
+    if bull_regime and not stop_close_breach and not sell_trigger_price:
         score = min(score, 62.0)
         if rs_percentile is not None and rs_percentile >= 55:
             score -= 6
         reasons.append("Bull trend trim bias")
 
-    if reference_asset and panic_low and not sell_trigger_price:
+    if reference_asset and panic_low and not stop_close_breach and not sell_trigger_price:
         score = min(score, 32.0)
         reasons.append("Capitulation sell cap")
 
@@ -1289,11 +1445,14 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     rsi = _coerce_float(row.get("RSI"))
     buy_countdown = int(row.get("BuyCountdown", 0) or 0)
     fear_greed = _coerce_float(row.get("FearGreed"))
+    tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
     rs_percentile = _coerce_float(row.get("RSPercentile"))
     volume_ratio = _coerce_float(row.get("VolumeRatio20"))
     mfi_change = _coerce_float(row.get("MFIChange5"))
     stop_touched = _coerce_bool(row.get("StopTouched"))
-    stop_close_breach = _coerce_bool(row.get("StopCloseBreach")) or stop_touched
+    stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
+    stop_price = _coerce_float(row.get("ChandelierStop"))
+    atr_value = _coerce_float(row.get("ATR"))
     buy_trigger_price = _coerce_bool(row.get("BuyTriggerPrice"))
     sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
     close_up_day = _coerce_bool(row.get("CloseUpDay"))
@@ -1314,19 +1473,34 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     )
     relative_support = bool(rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
     bullish_close = bool(close_value is not None and open_value is not None and close_value >= open_value)
+    tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
 
     buy_setup_threshold = preset.watch_threshold
     if bull_regime and relative_support:
         buy_setup_threshold -= 3
     if reference_asset:
         buy_setup_threshold -= 5
+    if tips_risk_off and not deep_reversal:
+        buy_setup_threshold += 2
     buy_setup_active = (
         (buy_score >= buy_setup_threshold and (buy_score >= sell_score - 10 or deep_reversal))
         or (reference_asset and cycle_score is not None and rsi is not None and cycle_score <= 20 and rsi <= 45)
     )
+    sell_setup_active = sell_score >= (preset.watch_threshold + (4 if reference_asset else 0)) and sell_score >= buy_score - 4 and not panic_low
+    stop_exit_confirmed, stop_emergency_exit, stop_gap_atr = evaluate_stop_exit(
+        close_value,
+        stop_price,
+        atr_value,
+        sell_score=sell_score,
+        buy_score=buy_score,
+        bearish_context=bear_regime,
+        sell_context=bool(sell_setup_active or sell_trigger_price),
+        hold_lock_active=False,
+        macro_risk_off=tips_risk_off,
+    )
     buy_trigger = bool(
         buy_setup_active
-        and not stop_close_breach
+        and not stop_exit_confirmed
         and (
             buy_trigger_price
             or (deep_reversal and bullish_close and (volume_support or relative_support))
@@ -1338,20 +1512,21 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
             or (bull_regime and buy_score >= max(preset.watch_threshold, preset.strong_threshold - 8) and bullish_close and volume_support)
         )
     )
-
-    sell_setup_active = sell_score >= (preset.watch_threshold + (4 if reference_asset else 0)) and sell_score >= buy_score - 4 and not panic_low
     sell_trigger = bool(
-        sell_setup_active
-        and (
-            (stop_touched and not panic_low)
-            or sell_trigger_price
-            or (close_down_day and sell_score >= max(preset.watch_threshold + 6, buy_score + 8) and bear_regime)
-            or (bear_regime and stop_close_breach)
+        stop_emergency_exit
+        or (
+            sell_setup_active
+            and (
+                stop_exit_confirmed
+                or sell_trigger_price
+                or (close_down_day and sell_score >= max(preset.watch_threshold + 6, buy_score + 8) and bear_regime)
+            )
         )
     )
     trim_ready = bool(
         sell_setup_active
         and not sell_trigger
+        and not stop_exit_confirmed
         and (
             bull_regime
             or (rs_percentile is not None and rs_percentile >= 50.0)
@@ -1360,9 +1535,12 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     )
 
     buy_strong_threshold = preset.strong_threshold - 5 if bull_regime and relative_support else preset.strong_threshold
-    sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_touched else preset.strong_threshold
+    sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_exit_confirmed else preset.strong_threshold
 
-    if reference_asset and panic_low and buy_setup_active and not sell_trigger:
+    if stop_emergency_exit:
+        state = "Strong Sell"
+        key_reasons = sell_reasons
+    elif reference_asset and panic_low and buy_setup_active and not sell_trigger:
         if buy_trigger and buy_score >= preset.strong_threshold - 6:
             state = "Strong Buy"
         elif buy_trigger or buy_score >= preset.watch_threshold + 2:
@@ -1370,7 +1548,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         else:
             state = "Weak Buy"
         key_reasons = buy_reasons
-    elif sell_trigger and (stop_touched or sell_score >= max(sell_strong_threshold, buy_score + 4)):
+    elif sell_trigger and (stop_emergency_exit or sell_score >= max(sell_strong_threshold, buy_score + 4)):
         state = "Strong Sell"
         key_reasons = sell_reasons
     elif sell_trigger and sell_score >= max(preset.watch_threshold + 8, buy_score + 6):
@@ -1411,6 +1589,9 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         "SellSetupActive": sell_setup_active,
         "BuyTrigger": buy_trigger,
         "SellTrigger": sell_trigger,
+        "StopExitConfirmed": stop_exit_confirmed,
+        "StopEmergencyExit": stop_emergency_exit,
+        "StopGapATR": stop_gap_atr,
         "SignalNote": note,
         "BuyReasonText": " | ".join(buy_reasons),
         "SellReasonText": " | ".join(sell_reasons),
@@ -1449,6 +1630,8 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     if frame.empty:
         return frame
 
+    min_hold_bars = preset_min_hold_bars(preset)
+    reentry_lock_bars = preset_reentry_lock_bars(preset)
     state_rows = [build_signal_state(row, preset) for row in frame.to_dict("records")]
     state_frame = frame.join(pd.DataFrame(state_rows, index=frame.index), how="left")
     setup_window = max(3, min(6, preset.cooldown_bars + 1))
@@ -1461,8 +1644,16 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     updated_sell_trigger: list[bool] = []
     updated_state: list[str] = []
     updated_note: list[str] = []
+    hold_lock_flags: list[bool] = []
+    reentry_lock_flags: list[bool] = []
+    updated_stop_exit_confirmed: list[bool] = []
+    updated_stop_emergency_exit: list[bool] = []
+    updated_stop_gap_atr: list[float | None] = []
+    in_virtual_position = False
+    entry_index = -10_000
+    last_exit_index = -10_000
 
-    for row in state_frame.to_dict("records"):
+    for index, row in enumerate(state_frame.to_dict("records")):
         buy_score = int(row.get("BuyScore", 0) or 0)
         sell_score = int(row.get("SellScore", 0) or 0)
         regime = str(row.get("Regime", "Range / Transition"))
@@ -1476,6 +1667,10 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         close_up_day = _coerce_bool(row.get("CloseUpDay", False))
         close_down_day = _coerce_bool(row.get("CloseDownDay", False))
         stop_touched = _coerce_bool(row.get("StopTouched", False))
+        stop_close_breach = _coerce_bool(row.get("StopCloseBreach", False))
+        close_value = _coerce_float(row.get("Close"))
+        stop_price = _coerce_float(row.get("ChandelierStop"))
+        atr_value = _coerce_float(row.get("ATR"))
         cycle_score = _coerce_float(row.get("CycleScore"))
         rsi = _coerce_float(row.get("RSI"))
         atr_stretch = _coerce_float(row.get("ATRStretch"))
@@ -1490,6 +1685,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         volume_ratio = _coerce_float(row.get("VolumeRatio20"))
         mfi_change = _coerce_float(row.get("MFIChange5"))
         rs_percentile = _coerce_float(row.get("RSPercentile"))
+        tips_risk_off = _coerce_bool(row.get("TIPSRiskOff", False))
         buy_peak_score = _coerce_float(row.get("BuySetupPeakScore")) or 0.0
         sell_peak_score = _coerce_float(row.get("SellSetupPeakScore")) or 0.0
         buy_flow_support = bool(
@@ -1516,24 +1712,53 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
             _coerce_bool(row.get("SellTriggerPrice", False))
             or (close_down_day and sell_flow_support)
         )
+        hold_lock_active = in_virtual_position and (index - entry_index) < min_hold_bars
+        reentry_lock_active = (not in_virtual_position) and (index - last_exit_index) < reentry_lock_bars
+        stop_exit_confirmed, stop_emergency_exit, stop_gap_atr = evaluate_stop_exit(
+            close_value,
+            stop_price,
+            atr_value,
+            sell_score=int(round(sell_peak_score or sell_score)),
+            buy_score=buy_score,
+            bearish_context=bear_regime,
+            sell_context=bool(sell_window or _coerce_bool(row.get("SellSetupActive", False)) or _coerce_bool(row.get("SellTriggerPrice", False))),
+            hold_lock_active=hold_lock_active,
+            macro_risk_off=tips_risk_off,
+        )
 
         if not buy_trigger and buy_window and reversal_confirmation and reversal_zone:
             if (
                 buy_peak_score >= preset.watch_threshold - (6 if reference_asset else 2)
                 and sell_score <= max(buy_peak_score + 8, preset.strong_threshold + 2)
                 and not (bear_regime and breakdown_confirmation and not panic_low)
+                and not stop_exit_confirmed
             ):
                 buy_trigger = True
         if not sell_trigger and sell_window and breakdown_confirmation and not panic_low:
             if sell_peak_score >= preset.watch_threshold + (6 if reference_asset else 4):
-                if sell_flow_support and (bear_regime or stop_touched or _coerce_bool(row.get("SellTriggerPrice", False))):
+                if sell_flow_support and (bear_regime or stop_exit_confirmed or _coerce_bool(row.get("SellTriggerPrice", False))):
                     sell_trigger = True
         if reference_asset and panic_low and buy_window and reversal_confirmation and buy_peak_score >= preset.watch_threshold - 8:
             buy_trigger = True
             sell_trigger = False
 
+        force_exit = bool(
+            stop_emergency_exit
+            or (
+                sell_trigger
+                and (
+                    sell_peak_score >= max(preset.strong_threshold + 8, buy_score + 10)
+                    or str(row.get("State", "")) == "Strong Sell"
+                )
+            )
+        )
+        if hold_lock_active and not force_exit:
+            sell_trigger = False
+        if reentry_lock_active and buy_trigger and buy_peak_score < max(preset.strong_threshold + 2, sell_score + 10):
+            buy_trigger = False
+
         buy_strong_threshold = preset.strong_threshold - (8 if reference_asset else 5) if bull_regime else preset.strong_threshold - (4 if reference_asset else 0)
-        sell_strong_threshold = preset.strong_threshold + 10 if bull_regime and not stop_touched else preset.strong_threshold
+        sell_strong_threshold = preset.strong_threshold + 10 if bull_regime and not stop_exit_confirmed else preset.strong_threshold
         if reference_asset and panic_low and (buy_trigger or buy_window):
             if buy_peak_score >= preset.strong_threshold - 6 and reversal_confirmation:
                 state = "Strong Buy"
@@ -1541,7 +1766,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
                 state = "Buy"
             else:
                 state = "Weak Buy"
-        elif sell_trigger and (stop_touched or sell_peak_score >= max(sell_strong_threshold, buy_score + 10)):
+        elif sell_trigger and (stop_emergency_exit or sell_peak_score >= max(sell_strong_threshold, buy_score + 10)):
             state = "Strong Sell"
         elif sell_trigger and sell_peak_score >= max(preset.watch_threshold + 8, buy_score + 6):
             state = "Sell"
@@ -1558,19 +1783,59 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         else:
             state = "Hold / Neutral"
 
+        if hold_lock_active and not force_exit:
+            if state in {"Strong Sell", "Sell"}:
+                state = "Weak Buy" if buy_window else "Hold / Neutral"
+            elif state == "Weak Sell":
+                state = "Hold / Neutral"
+        if reentry_lock_active and not buy_trigger:
+            if state in {"Strong Buy", "Buy"}:
+                state = "Weak Buy"
+        if stop_emergency_exit:
+            buy_trigger = False
+            sell_trigger = True
+            state = "Strong Sell"
+        elif state in {"Strong Buy", "Buy", "Weak Buy"}:
+            sell_trigger = False
+        elif state in {"Strong Sell", "Sell", "Weak Sell"}:
+            buy_trigger = False
+
         row["BuySetupPeakScore"] = buy_peak_score
         row["SellSetupPeakScore"] = sell_peak_score
         row["BuyTrigger"] = buy_trigger
         row["SellTrigger"] = sell_trigger
+        row["HoldLockActive"] = hold_lock_active
+        row["ReentryLockActive"] = reentry_lock_active
+        row["StopExitConfirmed"] = stop_exit_confirmed
+        row["StopEmergencyExit"] = stop_emergency_exit
+        row["StopGapATR"] = stop_gap_atr
         updated_buy_trigger.append(buy_trigger)
         updated_sell_trigger.append(sell_trigger)
         updated_state.append(state)
         updated_note.append(_compose_signal_note(pd.Series(row), state))
+        hold_lock_flags.append(hold_lock_active)
+        reentry_lock_flags.append(reentry_lock_active)
+        updated_stop_exit_confirmed.append(stop_exit_confirmed)
+        updated_stop_emergency_exit.append(stop_emergency_exit)
+        updated_stop_gap_atr.append(stop_gap_atr)
+
+        if not in_virtual_position and buy_trigger:
+            in_virtual_position = True
+            entry_index = index
+        elif in_virtual_position and sell_trigger:
+            in_virtual_position = False
+            last_exit_index = index
+            entry_index = -10_000
 
     state_frame["BuyTrigger"] = updated_buy_trigger
     state_frame["SellTrigger"] = updated_sell_trigger
     state_frame["State"] = updated_state
     state_frame["SignalNote"] = updated_note
+    state_frame["HoldLockActive"] = hold_lock_flags
+    state_frame["ReentryLockActive"] = reentry_lock_flags
+    state_frame["StopExitConfirmed"] = updated_stop_exit_confirmed
+    state_frame["StopEmergencyExit"] = updated_stop_emergency_exit
+    state_frame["StopGapATR"] = updated_stop_gap_atr
     return state_frame
 
 
@@ -1654,24 +1919,55 @@ def build_trade_replay_from_state_frame(
     last_buy_index = -10_000
     last_sell_index = -10_000
     last_partial_index = -10_000
+    entry_index = -10_000
+    min_hold_bars = preset_min_hold_bars(preset)
+    partial_hold_bars = max(1, min_hold_bars - 1)
     iter_frame = state_frame.reset_index().rename(columns={"index": "Date"})
 
     for position, row in enumerate(iter_frame.itertuples(index=False)):
         timestamp = pd.Timestamp(row.Date)
         state = str(row.State)
+        state_sell_side = state in {"Weak Sell", "Sell", "Strong Sell"}
         price = float(row.Close)
         low_price = float(getattr(row, "Low", price))
         stop_price = float(row.ChandelierStop) if pd.notna(getattr(row, "ChandelierStop", np.nan)) else np.nan
-        stop_breached = bool(
+        stop_touched = bool(
             _coerce_bool(getattr(row, "StopTouched", False))
             or (pd.notna(stop_price) and low_price <= stop_price)
         )
         note = str(row.SignalNote)
         buy_score = int(row.BuyScore)
         sell_score = int(row.SellScore)
+        atr_value = _coerce_float(getattr(row, "ATR", np.nan))
         buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", state in {"Buy", "Strong Buy"}))
-        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", state in {"Sell", "Strong Sell"})) or stop_breached
-        sell_setup_active = _coerce_bool(getattr(row, "SellSetupActive", state in {"Weak Sell", "Sell", "Strong Sell"}))
+        sell_setup_active = _coerce_bool(getattr(row, "SellSetupActive", state_sell_side))
+        hold_bars_elapsed = position - entry_index if in_position else 10_000
+        hold_lock_active = in_position and hold_bars_elapsed < min_hold_bars
+        stop_exit_confirmed = _coerce_bool(getattr(row, "StopExitConfirmed", False))
+        stop_emergency_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
+        if not stop_exit_confirmed and not stop_emergency_exit:
+            stop_exit_confirmed, stop_emergency_exit, _ = evaluate_stop_exit(
+                price,
+                None if pd.isna(stop_price) else stop_price,
+                atr_value,
+                sell_score=sell_score,
+                buy_score=buy_score,
+                bearish_context=state in {"Sell", "Strong Sell"},
+                sell_context=bool(sell_setup_active or state_sell_side),
+                hold_lock_active=hold_lock_active,
+            )
+        sell_trigger = (
+            _coerce_bool(getattr(row, "SellTrigger", state in {"Sell", "Strong Sell"}))
+            or stop_emergency_exit
+            or (stop_exit_confirmed and state_sell_side)
+        )
+        force_exit = bool(
+            stop_emergency_exit
+            or (
+                state == "Strong Sell"
+                and sell_score >= max(preset.strong_threshold + 8, buy_score + 10)
+            )
+        )
 
         buy_ready = (not in_position) and buy_trigger and (position - last_buy_index) >= preset.cooldown_bars
         partial_ready = (
@@ -1679,11 +1975,14 @@ def build_trade_replay_from_state_frame(
             and (not partial_taken)
             and state == "Weak Sell"
             and sell_setup_active
+            and not stop_exit_confirmed
+            and (hold_bars_elapsed >= partial_hold_bars)
             and (position - last_partial_index) >= preset.cooldown_bars
         )
         sell_ready = (
             in_position
             and sell_trigger
+            and ((hold_bars_elapsed >= min_hold_bars) or force_exit)
             and (position - last_sell_index) >= preset.cooldown_bars
         )
 
@@ -1696,6 +1995,7 @@ def build_trade_replay_from_state_frame(
             position_remaining = 1.0
             realized_return = 0.0
             last_buy_index = position
+            entry_index = position
             events.append(
                 {
                     "Ticker": ticker,
@@ -1735,7 +2035,7 @@ def build_trade_replay_from_state_frame(
             continue
 
         if sell_ready and entry_price is not None and entry_date is not None and position_remaining > 0:
-            exit_price = stop_price if stop_breached and pd.notna(stop_price) else price
+            exit_price = price
             realized_return += position_remaining * (exit_price / entry_price - 1.0)
             last_sell_index = position
             events.append(
@@ -1749,7 +2049,7 @@ def build_trade_replay_from_state_frame(
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
                     "PositionAfter": 0.0,
-                    "Reason": "Trailing stop touched" if stop_breached and pd.notna(stop_price) else note,
+                    "Reason": "Trailing stop confirmed" if (stop_exit_confirmed or stop_emergency_exit or (stop_touched and pd.notna(stop_price) and price <= stop_price)) else note,
                 }
             )
             trades.append(
@@ -1772,6 +2072,7 @@ def build_trade_replay_from_state_frame(
             entry_price = None
             position_remaining = 0.0
             realized_return = 0.0
+            entry_index = -10_000
 
     if in_position and entry_price is not None and entry_date is not None:
         last_timestamp = pd.Timestamp(state_frame.index[-1])
@@ -1809,13 +2110,26 @@ def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) ->
     for position, row in enumerate(iter_frame.itertuples(index=False)):
         price = float(row.Close)
         stop_price = float(row.ChandelierStop) if pd.notna(getattr(row, "ChandelierStop", np.nan)) else np.nan
-        low_price = float(getattr(row, "Low", price))
-        stop_breached = bool(
-            _coerce_bool(getattr(row, "StopTouched", False))
-            or (pd.notna(stop_price) and low_price <= stop_price)
-        )
+        atr_value = _coerce_float(getattr(row, "ATR", np.nan))
         buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", str(row.State) in {"Buy", "Strong Buy"}))
-        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", str(row.State) in {"Sell", "Strong Sell"})) or stop_breached
+        stop_exit_confirmed = _coerce_bool(getattr(row, "StopExitConfirmed", False))
+        stop_emergency_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
+        if not stop_exit_confirmed and not stop_emergency_exit:
+            stop_exit_confirmed, stop_emergency_exit, _ = evaluate_stop_exit(
+                price,
+                None if pd.isna(stop_price) else stop_price,
+                atr_value,
+                sell_score=int(row.SellScore),
+                buy_score=int(row.BuyScore),
+                bearish_context=str(row.State) in {"Sell", "Strong Sell"},
+                sell_context=bool(_coerce_bool(getattr(row, "SellSetupActive", False)) or str(row.State) in {"Weak Sell", "Sell", "Strong Sell"}),
+                hold_lock_active=_coerce_bool(getattr(row, "HoldLockActive", False)),
+            )
+        sell_trigger = (
+            _coerce_bool(getattr(row, "SellTrigger", str(row.State) in {"Sell", "Strong Sell"}))
+            or stop_emergency_exit
+            or (stop_exit_confirmed and str(row.State) in {"Weak Sell", "Sell", "Strong Sell"})
+        )
 
         if buy_trigger and sell_trigger:
             if int(row.SellScore) >= int(row.BuyScore):
@@ -1843,7 +2157,7 @@ def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) ->
                     {
                         "Date": pd.Timestamp(row.Date),
                         "Signal": "SELL",
-                        "Price": stop_price if stop_breached and pd.notna(stop_price) else price,
+                        "Price": price,
                         "State": str(row.State),
                         "BuyScore": int(row.BuyScore),
                         "SellScore": int(row.SellScore),
@@ -2133,9 +2447,10 @@ def render_ticker_panel(
 ) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
     latest = state_frame.dropna(subset=["Close"]).iloc[-1]
+    display_label = format_snapshot_label(snapshot)
     left, right = st.columns([1.65, 1.0])
     with left:
-        st.plotly_chart(build_price_context_figure(selected_ticker, state_frame, chart_signal_frame, preset), width="stretch", config={"displaylogo": False})
+        st.plotly_chart(build_price_context_figure(display_label, state_frame, chart_signal_frame, preset), width="stretch", config={"displaylogo": False})
     with right:
         score_cards_top = st.columns(2)
         with score_cards_top[0]:
@@ -2286,6 +2601,15 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
         record("atr_and_stop_direction", False, str(exc))
 
     try:
+        momentum_index = pd.date_range("2023-01-02", periods=100, freq="B")
+        up_momentum = calc_13612w_momentum(pd.Series(np.linspace(100, 130, 100), index=momentum_index)).dropna()
+        down_momentum = calc_13612w_momentum(pd.Series(np.linspace(130, 100, 100), index=momentum_index)).dropna()
+        passed = bool(not up_momentum.empty and not down_momentum.empty and up_momentum.iloc[-1] > 0 and down_momentum.iloc[-1] < 0)
+        record("tips_13612w_momentum_sign", passed, f"up_last={up_momentum.iloc[-1]:.4f}, down_last={down_momentum.iloc[-1]:.4f}")
+    except Exception as exc:
+        record("tips_13612w_momentum_sign", False, str(exc))
+
+    try:
         preset = PROFILE_PRESETS["Balanced"]
         replay_index = pd.date_range("2024-01-02", periods=6, freq="B")
         replay_state = pd.DataFrame(
@@ -2335,6 +2659,33 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
 
     try:
         preset = PROFILE_PRESETS["Balanced"]
+        whipsaw_index = pd.date_range("2024-05-01", periods=6, freq="B")
+        whipsaw_state = pd.DataFrame(
+            {
+                "Close": [100.0, 102.0, 101.0, 100.5, 99.0, 98.0],
+                "Low": [99.0, 101.0, 100.8, 100.0, 98.8, 97.5],
+                "ChandelierStop": [92.0, 94.0, 95.0, 95.0, 95.0, 95.0],
+                "State": ["Hold / Neutral", "Buy", "Sell", "Weak Sell", "Sell", "Strong Sell"],
+                "BuyScore": [25, 74, 45, 38, 22, 10],
+                "SellScore": [20, 18, 72, 60, 82, 92],
+                "BuyTrigger": [False, True, False, False, False, False],
+                "SellTrigger": [False, False, True, False, True, True],
+                "SellSetupActive": [False, False, True, True, True, True],
+                "StopTouched": [False, False, False, False, False, True],
+                "SignalNote": ["n"] * 6,
+            },
+            index=whipsaw_index,
+        )
+        events, _, _ = build_trade_replay_from_state_frame("WHIP", whipsaw_state, preset)
+        signals = events["Signal"].tolist()
+        first_sell_date = events.loc[events["Signal"] == "SELL", "Date"].iloc[0] if (events["Signal"] == "SELL").any() else None
+        passed = bool(signals and signals[0] == "BUY" and first_sell_date is not None and pd.Timestamp(first_sell_date) >= whipsaw_index[4])
+        record("whipsaw_guard", passed, f"signals={signals}, first_sell={first_sell_date}")
+    except Exception as exc:
+        record("whipsaw_guard", False, str(exc))
+
+    try:
+        preset = PROFILE_PRESETS["Balanced"]
         marker_index = pd.date_range("2024-04-01", periods=7, freq="B")
         marker_state = pd.DataFrame(
             {
@@ -2354,6 +2705,48 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
         record("chart_signal_visibility", passed, f"signals={signals}")
     except Exception as exc:
         record("chart_signal_visibility", False, str(exc))
+
+    try:
+        plain = TickerSnapshot(
+            ticker="SPY",
+            resolved_symbol="SPY",
+            as_of=pd.Timestamp("2024-01-02"),
+            last_close=100.0,
+            daily_return=0.01,
+            state="Buy",
+            buy_score=70,
+            sell_score=20,
+            cycle_score=10.0,
+            td_label="Buy setup 9",
+            atr_stretch=-1.2,
+            rsi=35.0,
+            fear_greed=42.0,
+            stop_distance=0.05,
+            note="n",
+            warning=None,
+        )
+        resolved = TickerSnapshot(
+            ticker="005930",
+            resolved_symbol="005930.KS",
+            as_of=pd.Timestamp("2024-01-02"),
+            last_close=100.0,
+            daily_return=0.01,
+            state="Buy",
+            buy_score=70,
+            sell_score=20,
+            cycle_score=10.0,
+            td_label="Buy setup 9",
+            atr_stretch=-1.2,
+            rsi=35.0,
+            fear_greed=42.0,
+            stop_distance=0.05,
+            note="n",
+            warning=None,
+        )
+        passed = format_snapshot_label(plain) == "SPY" and format_snapshot_label(resolved) == "005930 (005930.KS)"
+        record("drilldown_label_alignment", passed, f"plain={format_snapshot_label(plain)}, resolved={format_snapshot_label(resolved)}")
+    except Exception as exc:
+        record("drilldown_label_alignment", False, str(exc))
 
     return results
 
@@ -2432,6 +2825,7 @@ def main() -> None:
                 price_frame,
                 macro_data["score_series"],
                 macro_data.get("benchmark_close"),
+                macro_data.get("tips_13612w_momentum"),
                 payload["resolved_symbol"],
             )
             state_frame = build_state_frame(indicators, preset)
@@ -2456,9 +2850,15 @@ def main() -> None:
         render_diagnostics(diagnostics, performance_frame)
         st.stop()
 
-    ticker_options = watchlist_frame["ticker"].tolist()
-    selected_ticker = st.selectbox("Drill-down ticker", options=ticker_options, index=0)
-    selected_snapshot = next(snapshot for snapshot in snapshots if snapshot.ticker == selected_ticker)
+    snapshot_by_ticker = {snapshot.ticker: snapshot for snapshot in snapshots}
+    ticker_options = [ticker for ticker in watchlist_frame["ticker"].tolist() if ticker in snapshot_by_ticker]
+    selected_ticker = st.selectbox(
+        "Drill-down ticker",
+        options=ticker_options,
+        index=0,
+        format_func=lambda ticker: format_snapshot_label(snapshot_by_ticker[ticker]),
+    )
+    selected_snapshot = snapshot_by_ticker[selected_ticker]
     selected_state_frame = state_frames[selected_ticker]
     replay_started_at = time.perf_counter()
     event_frame, trade_frame, replay_summary = build_trade_replay_from_state_frame(selected_ticker, selected_state_frame, preset)
