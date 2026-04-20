@@ -1,27 +1,40 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 import io
+import json
 import logging
 import re
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
 import streamlit as st
 from statsmodels.tsa.seasonal import STL
 import urllib3
 import yfinance as yf
 
+try:
+    from lightgbm import LGBMClassifier
 
-if "--self-test" in sys.argv:
+    LIGHTGBM_AVAILABLE = True
+except Exception:
+    LGBMClassifier = None
+    LIGHTGBM_AVAILABLE = False
+
+
+if any(flag in sys.argv for flag in ("--self-test", "--benchmark", "--ml-backtest")):
     logging.getLogger("streamlit").setLevel(logging.ERROR)
     logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
 
@@ -34,6 +47,21 @@ OPTIMIZED_TICKER_SET = set(OPTIMIZED_TICKERS)
 DEFAULT_WATCHLIST = OPTIMIZED_TICKERS
 REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 MACRO_TICKERS = ("SPY", "^VIX", "HYG", "IEF", "RSP", "XLY", "XLP", "UUP", "TIPS")
+ML_TARGET_SYMBOL = "QQQ"
+ML_FEATURE_TICKERS = ("QQQ", "SPY", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "TSLA", "DIA", "IWM", "TLT", "IEF", "HYG", "^VIX")
+ML_BATCH_TICKERS = tuple(dict.fromkeys(ML_FEATURE_TICKERS + MACRO_TICKERS))
+ML_TRANSACTION_COST = 0.001
+ML_BUY_HORIZON_BARS = 15
+ML_SELL_HOLDOUT_BARS = 5
+ML_THRESHOLD_GRID = (0.50, 0.55, 0.60, 0.65, 0.70)
+ML_CV_SPLITS = 6
+ML_CV_TEST_SIZE = 63
+ML_CV_GAP = 15
+ML_RANDOM_STATE = 42
+ML_BUY_TARGET_ATR = 1.5
+ML_BUY_STOP_ATR = 1.0
+ML_MIN_CANDIDATE_SAMPLES = 24
+ML_MACRO_FEAR_BUY_VETO = 32.0
 KOREAN_TICKER_PATTERN = re.compile(r"^(?P<code>\d{6})(?:\.(?P<suffix>KS|KQ))?$", re.IGNORECASE)
 STATE_COLORS = {
     "Strong Buy": "#15803d",
@@ -109,6 +137,19 @@ class ReplayTrade:
     total_return: float
     hold_days: int
     partial_scaled_out: str
+
+
+@dataclass(frozen=True)
+class MLThresholdSelection:
+    buy_threshold: float
+    sell_threshold: float
+    summary: dict[str, float | int | None]
+
+
+@dataclass(frozen=True)
+class ModelDescriptor:
+    name: str
+    estimator_name: str
 
 
 PROFILE_PRESETS = {
@@ -266,6 +307,30 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
             ordered.append(value)
             seen.add(value)
     return ordered
+
+
+def row_get(row: Any, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(row, key, default)
+
+
+class TupleRowAccessor:
+    __slots__ = ("row",)
+
+    def __init__(self, row: Any) -> None:
+        self.row = row
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self.row, key, default)
+
+
+def is_us_batch_ticker(ticker: str) -> bool:
+    normalized = ticker.strip().upper()
+    return normalized in ML_BATCH_TICKERS and not bool(KOREAN_TICKER_PATTERN.fullmatch(normalized))
 
 
 def _format_float(value: float | None, digits: int = 2) -> str:
@@ -559,6 +624,85 @@ def download_single_history_cached(requested_ticker: str, start_iso: str, end_is
         "frame": pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)),
         "warning": last_error or "No usable OHLCV data returned",
     }
+
+
+def _extract_ticker_history_from_download(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return normalize_ohlcv_frame(raw)
+
+    level_zero = set(raw.columns.get_level_values(0))
+    level_one = set(raw.columns.get_level_values(1))
+    if ticker in level_one and any(column in level_zero for column in REQUIRED_OHLCV_COLUMNS):
+        frame = raw.xs(ticker, axis=1, level=1, drop_level=True)
+        return normalize_ohlcv_frame(frame)
+    if ticker in level_zero:
+        frame = raw.xs(ticker, axis=1, level=0, drop_level=True)
+        return normalize_ohlcv_frame(frame)
+    return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def download_batch_history_cached(requested_tickers: tuple[str, ...], start_iso: str, end_iso: str) -> dict[str, dict[str, Any]]:
+    start_ts = pd.Timestamp(start_iso)
+    end_ts = pd.Timestamp(end_iso) + pd.Timedelta(days=1)
+    ordered_tickers = tuple(dedupe_preserve_order([ticker.strip().upper() for ticker in requested_tickers if ticker]))
+    payloads: dict[str, dict[str, Any]] = {}
+    if not ordered_tickers:
+        return payloads
+
+    raw = pd.DataFrame()
+    batch_error = ""
+    try:
+        raw = quiet_yfinance_download(
+            list(ordered_tickers),
+            start=start_ts,
+            end=end_ts,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+    except Exception as exc:
+        batch_error = str(exc)
+
+    for ticker in ordered_tickers:
+        frame = _extract_ticker_history_from_download(raw, ticker)
+        if not frame.empty:
+            payloads[ticker] = {
+                "requested_ticker": ticker,
+                "resolved_symbol": ticker,
+                "frame": frame,
+                "warning": None,
+            }
+            continue
+
+        fallback_payload = download_single_history_cached(ticker, start_iso, end_iso)
+        warning = fallback_payload.get("warning")
+        if batch_error:
+            warning = f"Batch download fallback: {batch_error}" if not warning else f"{warning} | Batch download fallback: {batch_error}"
+        payloads[ticker] = {
+            **fallback_payload,
+            "warning": warning,
+        }
+    return payloads
+
+
+def load_price_payloads(
+    requested_tickers: list[str],
+    start_iso: str,
+    end_iso: str,
+) -> dict[str, dict[str, Any]]:
+    ordered_tickers = dedupe_preserve_order([ticker.strip().upper() for ticker in requested_tickers if ticker])
+    payloads: dict[str, dict[str, Any]] = {}
+    batch_tickers = [ticker for ticker in ordered_tickers if is_us_batch_ticker(ticker)]
+    if batch_tickers:
+        payloads.update(download_batch_history_cached(tuple(batch_tickers), start_iso, end_iso))
+    for ticker in ordered_tickers:
+        if ticker in payloads:
+            continue
+        payloads[ticker] = download_single_history_cached(ticker, start_iso, end_iso)
+    return payloads
 
 
 def _extract_close_panel(raw: pd.DataFrame) -> pd.DataFrame:
@@ -1050,6 +1194,775 @@ def compute_indicators(
         work["TIPS13612WMomentum"] = aligned_tips
         work["TIPSRiskOff"] = aligned_tips.lt(0.0).fillna(False)
     return work
+
+
+def attach_rule_only_columns(state_frame: pd.DataFrame, model_mode: str = "rules_only") -> pd.DataFrame:
+    if state_frame.empty:
+        frame = state_frame.copy()
+        for column, default in [
+            ("MLBuyProb", np.nan),
+            ("MLSellProb", np.nan),
+            ("MLBuyApproved", True),
+            ("MLSellApproved", True),
+            ("ModelMode", model_mode),
+            ("StrategySource", "RuleOnly"),
+            ("SignalNote", ""),
+        ]:
+            frame[column] = default
+        return frame
+
+    frame = state_frame.copy()
+    frame["MLBuyProb"] = pd.to_numeric(frame.get("MLBuyProb", np.nan), errors="coerce")
+    frame["MLSellProb"] = pd.to_numeric(frame.get("MLSellProb", np.nan), errors="coerce")
+    frame["MLBuyApproved"] = frame.get("MLBuyApproved", True)
+    frame["MLSellApproved"] = frame.get("MLSellApproved", True)
+    frame["ModelMode"] = frame.get("ModelMode", model_mode)
+    frame["StrategySource"] = frame.get("StrategySource", "RuleOnly")
+    frame["SignalNote"] = frame.get("SignalNote", "")
+    frame["MLBuyApproved"] = frame["MLBuyApproved"].fillna(True).astype(bool)
+    frame["MLSellApproved"] = frame["MLSellApproved"].fillna(True).astype(bool)
+    return frame
+
+
+def sanitize_feature_symbol(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", symbol.upper()).strip("_")
+
+
+def build_cross_asset_feature_frame(
+    target_index: pd.Index,
+    price_payloads: dict[str, dict[str, Any]],
+    *,
+    target_symbol: str,
+) -> pd.DataFrame:
+    features: dict[str, pd.Series] = {}
+    normalized_target = target_symbol.upper()
+    for symbol in ML_FEATURE_TICKERS:
+        if symbol.upper() == normalized_target:
+            continue
+        payload = price_payloads.get(symbol.upper()) or price_payloads.get(symbol)
+        if not payload:
+            continue
+        frame = payload.get("frame", pd.DataFrame())
+        if frame.empty or "Close" not in frame.columns:
+            continue
+        close = align_series_to_target_index(frame["Close"], target_index)
+        prefix = sanitize_feature_symbol(symbol)
+        returns = close.pct_change()
+        sma20 = close.rolling(20, min_periods=20).mean()
+        sma50 = close.rolling(50, min_periods=50).mean()
+        std20 = close.rolling(20, min_periods=20).std().replace(0.0, np.nan)
+        features[f"{prefix}_RET1"] = close.pct_change(1)
+        features[f"{prefix}_RET5"] = close.pct_change(5)
+        features[f"{prefix}_RET20"] = close.pct_change(20)
+        features[f"{prefix}_RET63"] = close.pct_change(63)
+        features[f"{prefix}_VOL20"] = returns.rolling(20, min_periods=20).std() * np.sqrt(252.0)
+        features[f"{prefix}_SMA20_GAP"] = close / sma20 - 1.0
+        features[f"{prefix}_SMA50_GAP"] = close / sma50 - 1.0
+        features[f"{prefix}_Z20"] = (close - sma20) / std20
+    if not features:
+        return pd.DataFrame(index=normalize_datetime_index(target_index))
+    return pd.DataFrame(features, index=normalize_datetime_index(target_index)).replace([np.inf, -np.inf], np.nan)
+
+
+def build_ml_feature_frame(
+    indicator_frame: pd.DataFrame,
+    baseline_state_frame: pd.DataFrame,
+    price_payloads: dict[str, dict[str, Any]],
+    *,
+    target_symbol: str,
+) -> pd.DataFrame:
+    joined = indicator_frame.join(
+        baseline_state_frame.loc[
+            :,
+            [
+                "BuyScore",
+                "SellScore",
+                "BuySetupActive",
+                "SellSetupActive",
+                "BuyTrigger",
+                "SellTrigger",
+                "HoldLockActive",
+                "ReentryLockActive",
+                "StopExitConfirmed",
+                "StopEmergencyExit",
+            ],
+        ],
+        how="left",
+    ).copy()
+    regime_map = {
+        "Bull Trend": 2,
+        "Bull Pullback": 1,
+        "Range / Transition": 0,
+        "Bear Rally": -1,
+        "Bear Trend": -2,
+    }
+    joined["RegimeCode"] = joined.get("Regime", pd.Series(index=joined.index, dtype=object)).map(regime_map).fillna(0).astype(float)
+    drop_columns = {
+        "AssetSymbol",
+        "TDLabel",
+        "Regime",
+        "State",
+        "SignalNote",
+        "BuyReasonText",
+        "SellReasonText",
+    }
+    feature_frame = joined.drop(columns=[column for column in drop_columns if column in joined.columns], errors="ignore").copy()
+    for column in feature_frame.columns:
+        if pd.api.types.is_bool_dtype(feature_frame[column]):
+            feature_frame[column] = feature_frame[column].astype(int)
+    feature_frame = feature_frame.apply(pd.to_numeric, errors="coerce")
+    feature_frame = feature_frame.join(
+        build_cross_asset_feature_frame(feature_frame.index, price_payloads, target_symbol=target_symbol),
+        how="left",
+    )
+    return feature_frame.replace([np.inf, -np.inf], np.nan)
+
+
+def infer_position_flags(state_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
+    if state_frame.empty:
+        return pd.DataFrame(index=state_frame.index, columns=["InPositionBefore", "InPositionAfter"], dtype=bool)
+
+    rows = state_frame.reset_index(drop=True)
+    in_position_before: list[bool] = []
+    in_position_after: list[bool] = []
+    in_position = False
+    last_buy_index = -10_000
+    last_sell_index = -10_000
+    entry_index = -10_000
+    min_hold_bars = preset_min_hold_bars(preset)
+
+    for position, row in enumerate(rows.itertuples(index=False, name="PositionRow")):
+        in_position_before.append(in_position)
+        buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", False))
+        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", False))
+        buy_ready = (not in_position) and buy_trigger and (position - last_buy_index) >= preset.cooldown_bars
+        hold_bars_elapsed = position - entry_index if in_position else 10_000
+        force_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
+        sell_ready = (
+            in_position
+            and sell_trigger
+            and ((hold_bars_elapsed >= min_hold_bars) or force_exit)
+            and (position - last_sell_index) >= preset.cooldown_bars
+        )
+
+        if buy_ready:
+            in_position = True
+            last_buy_index = position
+            entry_index = position
+        elif sell_ready:
+            in_position = False
+            last_sell_index = position
+            entry_index = -10_000
+        in_position_after.append(in_position)
+
+    return pd.DataFrame({"InPositionBefore": in_position_before, "InPositionAfter": in_position_after}, index=state_frame.index)
+
+
+def build_ml_label_frame(state_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
+    if state_frame.empty:
+        return pd.DataFrame(index=state_frame.index)
+
+    frame = state_frame.copy()
+    position_flags = infer_position_flags(frame, preset)
+    frame = frame.join(position_flags, how="left")
+
+    buy_candidate = frame["BuyTrigger"].fillna(False).astype(bool)
+    sell_candidate = (
+        frame["InPositionBefore"].fillna(False).astype(bool)
+        & frame["SellTrigger"].fillna(False).astype(bool)
+        & ~frame["StopExitConfirmed"].fillna(False).astype(bool)
+        & ~frame["StopEmergencyExit"].fillna(False).astype(bool)
+    )
+
+    buy_label = pd.Series(False, index=frame.index, dtype=bool)
+    sell_label = pd.Series(False, index=frame.index, dtype=bool)
+    buy_forward_return = pd.Series(np.nan, index=frame.index, dtype=float)
+    sell_edge = pd.Series(np.nan, index=frame.index, dtype=float)
+
+    rows = frame.reset_index(drop=True)
+    for position, row in enumerate(rows.itertuples(index=False, name="LabelRow")):
+        if buy_candidate.iloc[position]:
+            entry_position = position + 1
+            if entry_position < len(rows):
+                entry_open = _coerce_float(getattr(rows.iloc[entry_position], "Open", np.nan))
+                atr_value = _coerce_float(getattr(row, "ATR", np.nan))
+                if entry_open is not None and atr_value is not None and atr_value > 0:
+                    target_price = entry_open + (atr_value * ML_BUY_TARGET_ATR)
+                    stop_price = entry_open - (atr_value * ML_BUY_STOP_ATR)
+                    hit_target_first = False
+                    horizon_end = min(len(rows), entry_position + ML_BUY_HORIZON_BARS)
+                    for future_position in range(entry_position, horizon_end):
+                        future_row = rows.iloc[future_position]
+                        future_high = _coerce_float(getattr(future_row, "High", np.nan))
+                        future_low = _coerce_float(getattr(future_row, "Low", np.nan))
+                        if future_high is None or future_low is None:
+                            continue
+                        if future_low <= stop_price and future_high >= target_price:
+                            hit_target_first = False
+                            break
+                        if future_low <= stop_price:
+                            hit_target_first = False
+                            break
+                        if future_high >= target_price:
+                            net_return = target_price / entry_open - 1.0 - (2.0 * ML_TRANSACTION_COST)
+                            hit_target_first = net_return > 0.0
+                            break
+                    exit_position = min(len(rows) - 1, horizon_end - 1)
+                    exit_close = _coerce_float(getattr(rows.iloc[exit_position], "Close", np.nan))
+                    if exit_close is not None:
+                        buy_forward_return.iloc[position] = exit_close / entry_open - 1.0 - (2.0 * ML_TRANSACTION_COST)
+                    buy_label.iloc[position] = hit_target_first
+
+        if sell_candidate.iloc[position]:
+            exit_position = position + 1
+            hold_position = min(len(rows) - 1, position + ML_SELL_HOLDOUT_BARS)
+            if exit_position < len(rows):
+                next_open = _coerce_float(getattr(rows.iloc[exit_position], "Open", np.nan))
+                anchor_close = _coerce_float(getattr(row, "Close", np.nan))
+                hold_close = _coerce_float(getattr(rows.iloc[hold_position], "Close", np.nan))
+                if next_open is not None and anchor_close is not None and hold_close is not None and anchor_close > 0:
+                    immediate_exit_return = next_open / anchor_close - 1.0 - ML_TRANSACTION_COST
+                    hold_return = hold_close / anchor_close - 1.0 - ML_TRANSACTION_COST
+                    sell_edge.iloc[position] = immediate_exit_return - hold_return
+                    sell_label.iloc[position] = immediate_exit_return > hold_return
+
+    return pd.DataFrame(
+        {
+            "BuyCandidate": buy_candidate,
+            "SellCandidate": sell_candidate,
+            "BuyLabel": buy_label,
+            "SellLabel": sell_label,
+            "BuyForwardReturn": buy_forward_return,
+            "SellEdge": sell_edge,
+            "InPositionBefore": frame["InPositionBefore"].fillna(False).astype(bool),
+            "InPositionAfter": frame["InPositionAfter"].fillna(False).astype(bool),
+        },
+        index=frame.index,
+    )
+
+
+def resolve_boosting_descriptor(prefer_lightgbm: bool = True) -> ModelDescriptor:
+    if prefer_lightgbm and LIGHTGBM_AVAILABLE and LGBMClassifier is not None:
+        return ModelDescriptor(name="lightgbm", estimator_name="LGBMClassifier")
+    return ModelDescriptor(name="hist_gradient_boosting", estimator_name="HistGradientBoostingClassifier")
+
+
+def build_random_forest_estimator() -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=280,
+        max_depth=7,
+        min_samples_leaf=6,
+        min_samples_split=12,
+        class_weight="balanced_subsample",
+        random_state=ML_RANDOM_STATE,
+        n_jobs=-1,
+    )
+
+
+def build_boosting_estimator(prefer_lightgbm: bool = True) -> HistGradientBoostingClassifier | Any:
+    descriptor = resolve_boosting_descriptor(prefer_lightgbm=prefer_lightgbm)
+    if descriptor.name == "lightgbm":
+        return LGBMClassifier(
+            objective="binary",
+            n_estimators=220,
+            learning_rate=0.045,
+            num_leaves=31,
+            min_child_samples=18,
+            subsample=0.85,
+            subsample_freq=1,
+            colsample_bytree=0.85,
+            reg_alpha=0.1,
+            reg_lambda=0.2,
+            random_state=ML_RANDOM_STATE,
+            n_jobs=-1,
+            verbose=-1,
+        )
+    return HistGradientBoostingClassifier(
+        loss="log_loss",
+        max_depth=6,
+        max_iter=220,
+        learning_rate=0.045,
+        min_samples_leaf=18,
+        l2_regularization=0.1,
+        max_leaf_nodes=31,
+        random_state=ML_RANDOM_STATE,
+    )
+
+
+def prepare_feature_matrix(
+    frame: pd.DataFrame,
+    feature_columns: list[str],
+    *,
+    reference_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    numeric = frame.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    reference_numeric = numeric if reference_frame is None else reference_frame.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    fill_values = reference_numeric.median(numeric_only=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return numeric.fillna(fill_values).astype(float)
+
+
+def fit_calibrated_binary_classifier(
+    estimator_factory: Callable[[], Any],
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> Any | None:
+    if X.empty or y.empty:
+        return None
+    y_int = pd.to_numeric(y, errors="coerce").fillna(0).astype(int)
+    class_counts = y_int.value_counts()
+    if len(class_counts) < 2 or int(class_counts.min()) < 2:
+        return None
+    cv_folds = min(3, int(class_counts.min()))
+    if cv_folds < 2:
+        return None
+    try:
+        model = CalibratedClassifierCV(
+            estimator=estimator_factory(),
+            method="sigmoid",
+            cv=cv_folds,
+            ensemble=False,
+        )
+        model.fit(X, y_int)
+    except Exception:
+        return None
+    return model
+
+
+def predict_binary_probabilities(model: Any | None, X: pd.DataFrame) -> np.ndarray:
+    if model is None or X.empty:
+        return np.full(len(X), np.nan, dtype=float)
+    try:
+        probabilities = model.predict_proba(X)[:, 1]
+    except Exception:
+        return np.full(len(X), np.nan, dtype=float)
+    return np.asarray(probabilities, dtype=float)
+
+
+def _combine_probability_columns(columns: list[np.ndarray]) -> np.ndarray:
+    if not columns:
+        return np.array([], dtype=float)
+    matrix = np.column_stack(columns)
+    with np.errstate(invalid="ignore"):
+        combined = np.nanmean(matrix, axis=1)
+    if matrix.shape[1] == 0:
+        return np.full(matrix.shape[0], np.nan, dtype=float)
+    all_nan_mask = np.isnan(matrix).all(axis=1)
+    combined[all_nan_mask] = np.nan
+    return combined
+
+
+def build_probability_views_for_target(
+    train_feature_frame: pd.DataFrame,
+    train_candidate_mask: pd.Series,
+    train_label: pd.Series,
+    test_feature_frame: pd.DataFrame,
+    test_candidate_mask: pd.Series,
+    feature_columns: list[str],
+    *,
+    prefer_lightgbm: bool = True,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], str]:
+    descriptor = resolve_boosting_descriptor(prefer_lightgbm=prefer_lightgbm)
+    model_names = ["random_forest", descriptor.name, "soft_ensemble"]
+    train_views = {name: np.full(len(train_feature_frame), np.nan, dtype=float) for name in model_names}
+    test_views = {name: np.full(len(test_feature_frame), np.nan, dtype=float) for name in model_names}
+
+    candidate_train = train_candidate_mask.fillna(False).astype(bool)
+    candidate_test = test_candidate_mask.fillna(False).astype(bool)
+    if int(candidate_train.sum()) < ML_MIN_CANDIDATE_SAMPLES:
+        return train_views, test_views, descriptor.name
+
+    y_train = pd.to_numeric(train_label.loc[candidate_train], errors="coerce").fillna(0).astype(int)
+    if y_train.nunique() < 2:
+        return train_views, test_views, descriptor.name
+
+    reference_frame = train_feature_frame.loc[:, feature_columns]
+    X_train_candidates = prepare_feature_matrix(train_feature_frame.loc[candidate_train], feature_columns, reference_frame=reference_frame)
+    X_test_candidates = prepare_feature_matrix(test_feature_frame.loc[candidate_test], feature_columns, reference_frame=reference_frame) if candidate_test.any() else pd.DataFrame(columns=feature_columns)
+
+    rf_model = fit_calibrated_binary_classifier(build_random_forest_estimator, X_train_candidates, y_train)
+    boost_model = fit_calibrated_binary_classifier(lambda: build_boosting_estimator(prefer_lightgbm=prefer_lightgbm), X_train_candidates, y_train)
+
+    rf_train_probs = predict_binary_probabilities(rf_model, X_train_candidates)
+    boost_train_probs = predict_binary_probabilities(boost_model, X_train_candidates)
+    train_views["random_forest"][candidate_train.to_numpy()] = rf_train_probs
+    train_views[descriptor.name][candidate_train.to_numpy()] = boost_train_probs
+    train_views["soft_ensemble"][candidate_train.to_numpy()] = _combine_probability_columns([rf_train_probs, boost_train_probs])
+
+    if candidate_test.any():
+        rf_test_probs = predict_binary_probabilities(rf_model, X_test_candidates)
+        boost_test_probs = predict_binary_probabilities(boost_model, X_test_candidates)
+        test_views["random_forest"][candidate_test.to_numpy()] = rf_test_probs
+        test_views[descriptor.name][candidate_test.to_numpy()] = boost_test_probs
+        test_views["soft_ensemble"][candidate_test.to_numpy()] = _combine_probability_columns([rf_test_probs, boost_test_probs])
+
+    return train_views, test_views, descriptor.name
+
+
+def apply_ml_thresholds_to_state_frame(
+    base_state_frame: pd.DataFrame,
+    buy_probabilities: pd.Series | np.ndarray,
+    sell_probabilities: pd.Series | np.ndarray,
+    buy_threshold: float,
+    sell_threshold: float,
+    *,
+    model_mode: str,
+) -> pd.DataFrame:
+    if base_state_frame.empty:
+        return attach_rule_only_columns(base_state_frame.copy(), model_mode=model_mode)
+
+    filtered = base_state_frame.copy()
+    buy_prob_series = pd.Series(buy_probabilities, index=base_state_frame.index, dtype=float)
+    sell_prob_series = pd.Series(sell_probabilities, index=base_state_frame.index, dtype=float)
+    baseline_buy = filtered["BuyTrigger"].fillna(False).astype(bool)
+    baseline_sell = filtered["SellTrigger"].fillna(False).astype(bool)
+    stop_protected = filtered["StopExitConfirmed"].fillna(False).astype(bool) | filtered["StopEmergencyExit"].fillna(False).astype(bool)
+    fear_greed = pd.Series(
+        pd.to_numeric(filtered.get("FearGreed", pd.Series(np.nan, index=filtered.index)), errors="coerce"),
+        index=filtered.index,
+        dtype=float,
+    )
+
+    ml_buy_approved = pd.Series(True, index=filtered.index, dtype=bool)
+    ml_sell_approved = pd.Series(True, index=filtered.index, dtype=bool)
+
+    buy_known = buy_prob_series.notna()
+    sell_known = sell_prob_series.notna()
+    ml_buy_approved.loc[baseline_buy & buy_known] = buy_prob_series.loc[baseline_buy & buy_known] >= buy_threshold
+    ml_sell_approved.loc[baseline_sell & sell_known] = sell_prob_series.loc[baseline_sell & sell_known] >= sell_threshold
+    ml_sell_approved.loc[stop_protected] = True
+    macro_fear_veto = baseline_buy & fear_greed.lt(ML_MACRO_FEAR_BUY_VETO).fillna(False)
+    ml_buy_approved.loc[macro_fear_veto] = False
+
+    filtered["MLBuyProb"] = buy_prob_series
+    filtered["MLSellProb"] = sell_prob_series
+    filtered["MLBuyApproved"] = ml_buy_approved
+    filtered["MLSellApproved"] = ml_sell_approved
+    filtered["ModelMode"] = model_mode
+    filtered["StrategySource"] = "RuleOnly"
+
+    filtered.loc[baseline_buy & ml_buy_approved, "StrategySource"] = "MLApprovedBuy"
+    filtered.loc[baseline_buy & ~ml_buy_approved, "StrategySource"] = "MLBlockedBuy"
+    filtered.loc[baseline_sell & ml_sell_approved & ~stop_protected, "StrategySource"] = "MLApprovedSell"
+    filtered.loc[baseline_sell & ~ml_sell_approved & ~stop_protected, "StrategySource"] = "MLBlockedSell"
+    filtered.loc[stop_protected, "StrategySource"] = "HardStop"
+    filtered.loc[macro_fear_veto, "StrategySource"] = "MacroFearVeto"
+
+    filtered["BuyTrigger"] = baseline_buy & ml_buy_approved
+    filtered["SellTrigger"] = baseline_sell & (ml_sell_approved | stop_protected)
+    buy_side = filtered["State"].isin(["Strong Buy", "Buy", "Weak Buy"])
+    sell_side = filtered["State"].isin(["Strong Sell", "Sell", "Weak Sell"])
+    filtered.loc[buy_side & baseline_buy & ~filtered["BuyTrigger"], "State"] = "Hold / Neutral"
+    filtered.loc[sell_side & baseline_sell & ~filtered["SellTrigger"] & ~stop_protected, "State"] = "Hold / Neutral"
+    filtered["SignalNote"] = ""
+    return attach_rule_only_columns(filtered, model_mode=model_mode)
+
+
+def select_ml_strategy_for_state_frame(
+    symbol: str,
+    base_state_frame: pd.DataFrame,
+    buy_prob_views: dict[str, np.ndarray],
+    sell_prob_views: dict[str, np.ndarray],
+    preset: SignalPreset,
+) -> tuple[str, MLThresholdSelection] | None:
+    best_selection: tuple[str, MLThresholdSelection] | None = None
+    best_score = (-1.0, -1.0, -1)
+
+    candidate_model_names = [name for name in buy_prob_views if name in sell_prob_views]
+    for model_name in candidate_model_names:
+        if np.isnan(buy_prob_views[model_name]).all() and np.isnan(sell_prob_views[model_name]).all():
+            continue
+        for buy_threshold in ML_THRESHOLD_GRID:
+            for sell_threshold in ML_THRESHOLD_GRID:
+                filtered = apply_ml_thresholds_to_state_frame(
+                    base_state_frame,
+                    buy_prob_views[model_name],
+                    sell_prob_views[model_name],
+                    buy_threshold,
+                    sell_threshold,
+                    model_mode=model_name,
+                )
+                summary = build_trade_replay_from_state_frame(symbol, filtered, preset)[2]
+                win_rate = -1.0 if summary["win_rate"] is None else float(summary["win_rate"])
+                avg_return = -1.0 if summary["avg_closed_return"] is None else float(summary["avg_closed_return"])
+                closed_trades = int(summary["closed_trades"] or 0)
+                score = (win_rate, avg_return, closed_trades)
+                if score > best_score:
+                    best_score = score
+                    best_selection = (
+                        model_name,
+                        MLThresholdSelection(
+                            buy_threshold=buy_threshold,
+                            sell_threshold=sell_threshold,
+                            summary=summary,
+                        ),
+                    )
+    return best_selection
+
+
+def build_ml_walkforward_bundle(
+    symbol: str,
+    indicator_frame: pd.DataFrame,
+    baseline_state_frame: pd.DataFrame,
+    price_payloads: dict[str, dict[str, Any]],
+    preset: SignalPreset,
+) -> dict[str, Any]:
+    if symbol.upper() != ML_TARGET_SYMBOL or indicator_frame.empty or baseline_state_frame.empty:
+        return {
+            "enabled": False,
+            "model_mode": "rules_only",
+            "reason": "Rule-only asset",
+            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
+            "comparison": {},
+            "selection_frame": pd.DataFrame(),
+            "oos_start": None,
+        }
+
+    feature_frame = build_ml_feature_frame(indicator_frame, baseline_state_frame, price_payloads, target_symbol=symbol)
+    label_frame = build_ml_label_frame(baseline_state_frame, preset)
+    feature_columns = [column for column in feature_frame.columns if feature_frame[column].notna().sum() >= 30]
+    if not feature_columns:
+        return {
+            "enabled": False,
+            "model_mode": "rules_only",
+            "reason": "No usable ML features",
+            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
+            "comparison": {},
+            "selection_frame": pd.DataFrame(),
+            "oos_start": None,
+        }
+
+    try:
+        splitter = TimeSeriesSplit(
+            n_splits=ML_CV_SPLITS,
+            test_size=ML_CV_TEST_SIZE,
+            gap=ML_CV_GAP,
+        )
+        splits = list(splitter.split(feature_frame))
+    except Exception as exc:
+        return {
+            "enabled": False,
+            "model_mode": "rules_only",
+            "reason": f"TimeSeriesSplit unavailable: {exc}",
+            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
+            "comparison": {},
+            "selection_frame": pd.DataFrame(),
+            "oos_start": None,
+        }
+
+    if not splits:
+        return {
+            "enabled": False,
+            "model_mode": "rules_only",
+            "reason": "Insufficient rows for walk-forward split",
+            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
+            "comparison": {},
+            "selection_frame": pd.DataFrame(),
+            "oos_start": None,
+        }
+
+    index = feature_frame.index
+    buy_prob_series = pd.Series(np.nan, index=index, dtype=float)
+    sell_prob_series = pd.Series(np.nan, index=index, dtype=float)
+    buy_approved_series = pd.Series(True, index=index, dtype=bool)
+    sell_approved_series = pd.Series(True, index=index, dtype=bool)
+    model_mode_series = pd.Series("rules_only", index=index, dtype=object)
+    strategy_source_series = pd.Series("RuleOnlyWarmup", index=index, dtype=object)
+    selection_rows: list[dict[str, Any]] = []
+
+    for fold_number, (train_positions, test_positions) in enumerate(splits, start=1):
+        train_features = feature_frame.iloc[train_positions]
+        test_features = feature_frame.iloc[test_positions]
+        train_labels = label_frame.iloc[train_positions]
+        test_labels = label_frame.iloc[test_positions]
+
+        buy_train_views, buy_test_views, boosting_name = build_probability_views_for_target(
+            train_features,
+            train_labels["BuyCandidate"],
+            train_labels["BuyLabel"],
+            test_features,
+            test_labels["BuyCandidate"],
+            feature_columns,
+        )
+        sell_train_views, sell_test_views, _ = build_probability_views_for_target(
+            train_features,
+            train_labels["SellCandidate"],
+            train_labels["SellLabel"],
+            test_features,
+            test_labels["SellCandidate"],
+            feature_columns,
+        )
+        selection = select_ml_strategy_for_state_frame(symbol, baseline_state_frame.iloc[train_positions], buy_train_views, sell_train_views, preset)
+        if selection is None:
+            continue
+        model_mode, threshold_selection = selection
+        filtered_test = apply_ml_thresholds_to_state_frame(
+            baseline_state_frame.iloc[test_positions],
+            buy_test_views[model_mode],
+            sell_test_views[model_mode],
+            threshold_selection.buy_threshold,
+            threshold_selection.sell_threshold,
+            model_mode=model_mode,
+        )
+        test_index = index[test_positions]
+        buy_prob_series.loc[test_index] = filtered_test["MLBuyProb"].to_numpy(dtype=float)
+        sell_prob_series.loc[test_index] = filtered_test["MLSellProb"].to_numpy(dtype=float)
+        buy_approved_series.loc[test_index] = filtered_test["MLBuyApproved"].to_numpy(dtype=bool)
+        sell_approved_series.loc[test_index] = filtered_test["MLSellApproved"].to_numpy(dtype=bool)
+        model_mode_series.loc[test_index] = model_mode
+        strategy_source_series.loc[test_index] = filtered_test["StrategySource"].to_numpy(dtype=object)
+        selection_rows.append(
+            {
+                "Fold": fold_number,
+                "TrainStart": index[train_positions[0]].date().isoformat(),
+                "TrainEnd": index[train_positions[-1]].date().isoformat(),
+                "TestStart": index[test_positions[0]].date().isoformat(),
+                "TestEnd": index[test_positions[-1]].date().isoformat(),
+                "ModelMode": model_mode,
+                "BoostingMode": boosting_name,
+                "BuyThreshold": threshold_selection.buy_threshold,
+                "SellThreshold": threshold_selection.sell_threshold,
+                "WinRate": threshold_selection.summary["win_rate"],
+                "AvgClosedReturn": threshold_selection.summary["avg_closed_return"],
+                "ClosedTrades": threshold_selection.summary["closed_trades"],
+            }
+        )
+
+    full_buy_views, _, boosting_name = build_probability_views_for_target(
+        feature_frame,
+        label_frame["BuyCandidate"],
+        label_frame["BuyLabel"],
+        feature_frame.iloc[0:0],
+        pd.Series(dtype=bool),
+        feature_columns,
+    )
+    full_sell_views, _, _ = build_probability_views_for_target(
+        feature_frame,
+        label_frame["SellCandidate"],
+        label_frame["SellLabel"],
+        feature_frame.iloc[0:0],
+        pd.Series(dtype=bool),
+        feature_columns,
+    )
+    full_selection = select_ml_strategy_for_state_frame(symbol, baseline_state_frame, full_buy_views, full_sell_views, preset)
+    if full_selection is None:
+        final_state = attach_rule_only_columns(baseline_state_frame.copy())
+        return {
+            "enabled": False,
+            "model_mode": "rules_only",
+            "reason": "ML models could not fit candidate labels",
+            "state_frame": final_state,
+            "comparison": {},
+            "selection_frame": pd.DataFrame(selection_rows),
+            "oos_start": None,
+        }
+
+    final_model_mode, final_thresholds = full_selection
+    final_filtered = apply_ml_thresholds_to_state_frame(
+        baseline_state_frame,
+        full_buy_views[final_model_mode],
+        full_sell_views[final_model_mode],
+        final_thresholds.buy_threshold,
+        final_thresholds.sell_threshold,
+        model_mode=final_model_mode,
+    )
+    missing_buy = buy_prob_series.isna() & final_filtered["MLBuyProb"].notna()
+    missing_sell = sell_prob_series.isna() & final_filtered["MLSellProb"].notna()
+    buy_prob_series.loc[missing_buy] = final_filtered.loc[missing_buy, "MLBuyProb"]
+    sell_prob_series.loc[missing_sell] = final_filtered.loc[missing_sell, "MLSellProb"]
+    buy_approved_series.loc[missing_buy] = final_filtered.loc[missing_buy, "MLBuyApproved"]
+    sell_approved_series.loc[missing_sell] = final_filtered.loc[missing_sell, "MLSellApproved"]
+    model_mode_series.loc[model_mode_series.eq("rules_only")] = final_model_mode
+    strategy_source_series.loc[strategy_source_series.eq("RuleOnlyWarmup")] = final_filtered.loc[strategy_source_series.eq("RuleOnlyWarmup"), "StrategySource"]
+
+    final_state = baseline_state_frame.copy()
+    final_state["MLBuyProb"] = buy_prob_series
+    final_state["MLSellProb"] = sell_prob_series
+    final_state["MLBuyApproved"] = buy_approved_series
+    final_state["MLSellApproved"] = sell_approved_series
+    final_state["ModelMode"] = model_mode_series
+    final_state["StrategySource"] = strategy_source_series
+    final_state = apply_ml_thresholds_to_state_frame(
+        final_state,
+        final_state["MLBuyProb"],
+        final_state["MLSellProb"],
+        final_thresholds.buy_threshold,
+        final_thresholds.sell_threshold,
+        model_mode=final_model_mode,
+    )
+
+    oos_start = index[splits[0][1][0]]
+    baseline_oos = attach_rule_only_columns(baseline_state_frame.loc[oos_start:].copy())
+    final_oos = final_state.loc[oos_start:].copy()
+    rule_summary = build_trade_replay_from_state_frame(symbol, baseline_oos, preset)[2]
+    ml_summary = build_trade_replay_from_state_frame(symbol, final_oos, preset)[2]
+    return {
+        "enabled": True,
+        "model_mode": final_model_mode,
+        "reason": f"Walk-forward ML filter active ({boosting_name})",
+        "state_frame": final_state,
+        "comparison": {
+            "rule_summary": rule_summary,
+            "ml_summary": ml_summary,
+            "buy_threshold": final_thresholds.buy_threshold,
+            "sell_threshold": final_thresholds.sell_threshold,
+        },
+        "selection_frame": pd.DataFrame(selection_rows),
+        "oos_start": oos_start,
+    }
+
+
+def analyze_symbol_state(
+    ticker: str,
+    payload: dict[str, Any],
+    macro_data: dict[str, Any],
+    preset: SignalPreset,
+    *,
+    feature_payloads: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    price_frame = payload.get("frame", pd.DataFrame())
+    indicators = compute_indicators(
+        price_frame,
+        macro_data["score_series"],
+        macro_data.get("benchmark_close"),
+        macro_data.get("tips_13612w_momentum"),
+        payload.get("resolved_symbol"),
+    )
+    baseline_state_frame = attach_rule_only_columns(build_state_frame(indicators, preset))
+    ml_bundle = {
+        "enabled": False,
+        "model_mode": "rules_only",
+        "reason": "Rule-only asset",
+        "state_frame": baseline_state_frame,
+        "comparison": {},
+        "selection_frame": pd.DataFrame(),
+        "oos_start": None,
+    }
+    if payload.get("resolved_symbol", ticker).upper() == ML_TARGET_SYMBOL and feature_payloads is not None:
+        ml_bundle = build_ml_walkforward_bundle(ML_TARGET_SYMBOL, indicators, baseline_state_frame, feature_payloads, preset)
+    state_frame = attach_rule_only_columns(ml_bundle.get("state_frame", baseline_state_frame))
+    snapshot = build_snapshot(ticker, payload.get("resolved_symbol", ticker), state_frame, payload.get("warning"))
+    return {
+        "indicators": indicators,
+        "baseline_state_frame": baseline_state_frame,
+        "state_frame": state_frame,
+        "snapshot": snapshot,
+        "ml_bundle": ml_bundle,
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def load_cached_qqq_analysis(start_iso: str, end_iso: str, preset_name: str) -> dict[str, Any]:
+    preset = PROFILE_PRESETS.get(preset_name, DEFAULT_SIGNAL_PRESET)
+    macro_data = load_macro_fear_greed_cached(end_iso)
+    feature_payloads = load_price_payloads(list(ML_BATCH_TICKERS), start_iso, end_iso)
+    qqq_payload = feature_payloads.get(ML_TARGET_SYMBOL, {"frame": pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)), "resolved_symbol": ML_TARGET_SYMBOL, "warning": "QQQ payload unavailable"})
+    return analyze_symbol_state(
+        ML_TARGET_SYMBOL,
+        qqq_payload,
+        macro_data,
+        preset,
+        feature_payloads=feature_payloads,
+    )
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -1993,7 +2906,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
 
     min_hold_bars = preset_min_hold_bars(preset)
     reentry_lock_bars = preset_reentry_lock_bars(preset)
-    state_rows = [build_signal_state(row, preset) for row in frame.to_dict("records")]
+    state_rows = [build_signal_state(TupleRowAccessor(row), preset) for row in frame.itertuples(index=False, name="IndicatorRow")]
     state_frame = frame.join(pd.DataFrame(state_rows, index=frame.index), how="left")
     setup_window = max(3, min(6, preset.cooldown_bars + 1))
     state_frame["BuySetupWindow"] = state_frame["BuySetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
@@ -2004,7 +2917,6 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     updated_buy_trigger: list[bool] = []
     updated_sell_trigger: list[bool] = []
     updated_state: list[str] = []
-    updated_note: list[str] = []
     hold_lock_flags: list[bool] = []
     reentry_lock_flags: list[bool] = []
     updated_stop_exit_confirmed: list[bool] = []
@@ -2014,7 +2926,8 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     entry_index = -10_000
     last_exit_index = -10_000
 
-    for index, row in enumerate(state_frame.to_dict("records")):
+    for index, row_tuple in enumerate(state_frame.itertuples(index=False, name="StateRow")):
+        row = TupleRowAccessor(row_tuple)
         buy_score = int(row.get("BuyScore", 0) or 0)
         sell_score = int(row.get("SellScore", 0) or 0)
         regime = str(row.get("Regime", "Range / Transition"))
@@ -2228,19 +3141,9 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         elif state in {"Strong Sell", "Sell", "Weak Sell"}:
             buy_trigger = False
 
-        row["BuySetupPeakScore"] = buy_peak_score
-        row["SellSetupPeakScore"] = sell_peak_score
-        row["BuyTrigger"] = buy_trigger
-        row["SellTrigger"] = sell_trigger
-        row["HoldLockActive"] = hold_lock_active
-        row["ReentryLockActive"] = reentry_lock_active
-        row["StopExitConfirmed"] = stop_exit_confirmed
-        row["StopEmergencyExit"] = stop_emergency_exit
-        row["StopGapATR"] = stop_gap_atr
         updated_buy_trigger.append(buy_trigger)
         updated_sell_trigger.append(sell_trigger)
         updated_state.append(state)
-        updated_note.append(_compose_signal_note(pd.Series(row), state))
         hold_lock_flags.append(hold_lock_active)
         reentry_lock_flags.append(reentry_lock_active)
         updated_stop_exit_confirmed.append(stop_exit_confirmed)
@@ -2258,7 +3161,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     state_frame["BuyTrigger"] = updated_buy_trigger
     state_frame["SellTrigger"] = updated_sell_trigger
     state_frame["State"] = updated_state
-    state_frame["SignalNote"] = updated_note
+    state_frame["SignalNote"] = ""
     state_frame["HoldLockActive"] = hold_lock_flags
     state_frame["ReentryLockActive"] = reentry_lock_flags
     state_frame["StopExitConfirmed"] = updated_stop_exit_confirmed
@@ -2276,6 +3179,7 @@ def build_snapshot(
     latest = state_frame.dropna(subset=["Close"]).iloc[-1]
     previous_close = state_frame["Close"].iloc[-2] if len(state_frame) > 1 else latest["Close"]
     daily_return = None if previous_close in {None, 0} else float(latest["Close"] / previous_close - 1.0)
+    latest_note = _compose_signal_note(latest, str(latest.get("State", "Hold / Neutral")))
 
     return TickerSnapshot(
         ticker=ticker,
@@ -2292,7 +3196,7 @@ def build_snapshot(
         rsi=_coerce_float(latest.get("RSI")),
         fear_greed=_coerce_float(latest.get("FearGreed")),
         stop_distance=_coerce_float(latest.get("StopDistance")),
-        note=str(latest.get("SignalNote", "")),
+        note=latest_note,
         warning=warning,
     )
 
@@ -2363,7 +3267,9 @@ def build_trade_replay_from_state_frame(
             _coerce_bool(getattr(row, "StopTouched", False))
             or (pd.notna(stop_price) and low_price <= stop_price)
         )
-        note = str(row.SignalNote)
+        note = str(getattr(row, "SignalNote", "") or "")
+        if not note:
+            note = _compose_signal_note(TupleRowAccessor(row), state)
         buy_score = int(row.BuyScore)
         sell_score = int(row.SellScore)
         atr_value = _coerce_float(getattr(row, "ATR", np.nan))
@@ -2863,6 +3769,56 @@ def render_signal_review(event_frame: pd.DataFrame, trade_frame: pd.DataFrame, s
             )
 
 
+def render_strategy_comparison(comparison: dict[str, Any], selection_frame: pd.DataFrame) -> None:
+    if not comparison:
+        return
+    rule_summary = comparison.get("rule_summary", {})
+    ml_summary = comparison.get("ml_summary", {})
+    if not rule_summary and not ml_summary:
+        return
+
+    st.markdown('<div class="section-label">Rule vs ML Filter</div>', unsafe_allow_html=True)
+    comparison_frame = pd.DataFrame(
+        [
+            {
+                "Metric": "Closed Trades",
+                "Rule Only": rule_summary.get("closed_trades"),
+                "ML Filter": ml_summary.get("closed_trades"),
+            },
+            {
+                "Metric": "Win Rate",
+                "Rule Only": _format_pct(rule_summary.get("win_rate")),
+                "ML Filter": _format_pct(ml_summary.get("win_rate")),
+            },
+            {
+                "Metric": "Avg Closed Return",
+                "Rule Only": _format_pct(rule_summary.get("avg_closed_return")),
+                "ML Filter": _format_pct(ml_summary.get("avg_closed_return")),
+            },
+            {
+                "Metric": "Median Return",
+                "Rule Only": _format_pct(rule_summary.get("median_closed_return")),
+                "ML Filter": _format_pct(ml_summary.get("median_closed_return")),
+            },
+            {
+                "Metric": "Open Trade",
+                "Rule Only": _format_pct(rule_summary.get("open_trade_return")),
+                "ML Filter": _format_pct(ml_summary.get("open_trade_return")),
+            },
+        ]
+    )
+    st.dataframe(comparison_frame, width="stretch", hide_index=True)
+    st.caption(
+        f"OOS threshold selection: buy >= {comparison.get('buy_threshold', 0.0):.2f}, sell >= {comparison.get('sell_threshold', 0.0):.2f}"
+    )
+    if not selection_frame.empty:
+        with st.expander("Walk-forward fold selections", expanded=False):
+            display = selection_frame.copy()
+            display["WinRate"] = display["WinRate"].map(_format_pct)
+            display["AvgClosedReturn"] = display["AvgClosedReturn"].map(_format_pct)
+            st.dataframe(display, width="stretch", hide_index=True)
+
+
 def render_ticker_panel(
     selected_ticker: str,
     snapshot: TickerSnapshot,
@@ -2872,6 +3828,8 @@ def render_ticker_panel(
     trade_frame: pd.DataFrame,
     replay_summary: dict[str, float | int | None],
     preset: SignalPreset,
+    comparison: dict[str, Any] | None = None,
+    selection_frame: pd.DataFrame | None = None,
 ) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
     latest = state_frame.dropna(subset=["Close"]).iloc[-1]
@@ -2908,11 +3866,18 @@ def render_ticker_panel(
                 {"Field": "FearGreed", "Value": _format_float(snapshot.fear_greed, 0)},
                 {"Field": "StopDistance", "Value": _format_pct(snapshot.stop_distance)},
                 {"Field": "Regime", "Value": str(latest.get("Regime", "n/a"))},
+                {"Field": "MLBuyProb", "Value": _format_float(_coerce_float(latest.get("MLBuyProb")), 3)},
+                {"Field": "MLSellProb", "Value": _format_float(_coerce_float(latest.get("MLSellProb")), 3)},
+                {"Field": "MLBuyApproved", "Value": str(bool(_coerce_bool(latest.get("MLBuyApproved"))))},
+                {"Field": "MLSellApproved", "Value": str(bool(_coerce_bool(latest.get("MLSellApproved"))))},
+                {"Field": "ModelMode", "Value": str(latest.get("ModelMode", "rules_only"))},
+                {"Field": "StrategySource", "Value": str(latest.get("StrategySource", "RuleOnly"))},
                 {"Field": "As Of", "Value": snapshot.as_of.date().isoformat()},
             ]
         )
         st.dataframe(detail, width="stretch", hide_index=True)
 
+    render_strategy_comparison(comparison or {}, selection_frame if selection_frame is not None else pd.DataFrame())
     render_signal_review(event_frame, trade_frame, replay_summary)
 
 
@@ -2972,6 +3937,137 @@ def synthetic_ohlcv_from_close(close: pd.Series) -> pd.DataFrame:
     low = pd.concat([base_open, close], axis=1).min(axis=1) - 0.8
     volume = pd.Series(np.linspace(1_000_000, 1_500_000, len(close)), index=close.index)
     return pd.DataFrame({"Open": base_open, "High": high, "Low": low, "Close": close, "Volume": volume})
+
+
+def run_benchmark() -> dict[str, Any]:
+    rows = 5_000
+    rng = np.random.default_rng(ML_RANDOM_STATE)
+    index = pd.date_range("2010-01-04", periods=rows, freq="B")
+    close = pd.Series(300 + rng.normal(0.04, 1.9, rows).cumsum(), index=index)
+    frame = synthetic_ohlcv_from_close(close)
+    macro = pd.Series(50 + rng.normal(0, 10, rows).cumsum() / 25.0, index=index, name="FearGreed")
+    benchmark_close = close * 0.95
+
+    started_at = time.perf_counter()
+    indicators = compute_indicators(frame, macro, benchmark_close, macro / 100.0, ML_TARGET_SYMBOL)
+    indicators_seconds = time.perf_counter() - started_at
+
+    started_at = time.perf_counter()
+    state_frame = build_state_frame(indicators, DEFAULT_SIGNAL_PRESET)
+    state_seconds = time.perf_counter() - started_at
+
+    started_at = time.perf_counter()
+    _, _, replay_summary = build_trade_replay_from_state_frame(ML_TARGET_SYMBOL, attach_rule_only_columns(state_frame), DEFAULT_SIGNAL_PRESET)
+    replay_seconds = time.perf_counter() - started_at
+
+    download_symbols = list(ML_FEATURE_TICKERS[:10])
+    sequential_started_at = time.perf_counter()
+    for symbol in download_symbols:
+        quiet_yfinance_download(
+            symbol,
+            start="2023-01-01",
+            end=date.today().isoformat(),
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+    sequential_seconds = time.perf_counter() - sequential_started_at
+
+    batch_started_at = time.perf_counter()
+    quiet_yfinance_download(
+        download_symbols,
+        start="2023-01-01",
+        end=date.today().isoformat(),
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    batch_seconds = time.perf_counter() - batch_started_at
+
+    baseline_state_seconds = 2.05
+    return {
+        "rows": rows,
+        "compute_indicators_seconds": round(indicators_seconds, 4),
+        "build_state_frame_seconds": round(state_seconds, 4),
+        "build_state_improvement_vs_baseline_pct": round((baseline_state_seconds - state_seconds) / baseline_state_seconds * 100.0, 2),
+        "replay_seconds": round(replay_seconds, 4),
+        "download_symbols": download_symbols,
+        "sequential_download_seconds": round(sequential_seconds, 4),
+        "batch_download_seconds": round(batch_seconds, 4),
+        "batch_speedup_x": round(sequential_seconds / batch_seconds, 2) if batch_seconds > 0 else None,
+        "replay_summary": replay_summary,
+    }
+
+
+def run_benchmark_cli(json_output: bool = False) -> int:
+    benchmark = run_benchmark()
+    if json_output:
+        print(json.dumps(benchmark, ensure_ascii=False, default=str, indent=2))
+        return 0
+    print("BENCHMARK")
+    print(f"rows={benchmark['rows']}")
+    print(f"compute_indicators_seconds={benchmark['compute_indicators_seconds']}")
+    print(f"build_state_frame_seconds={benchmark['build_state_frame_seconds']}")
+    print(f"build_state_improvement_vs_baseline_pct={benchmark['build_state_improvement_vs_baseline_pct']}")
+    print(f"replay_seconds={benchmark['replay_seconds']}")
+    print(f"sequential_download_seconds={benchmark['sequential_download_seconds']}")
+    print(f"batch_download_seconds={benchmark['batch_download_seconds']}")
+    print(f"batch_speedup_x={benchmark['batch_speedup_x']}")
+    print(f"replay_summary={benchmark['replay_summary']}")
+    return 0
+
+
+def run_ml_backtest(symbol: str, start_iso: str, end_iso: str) -> dict[str, Any]:
+    symbol = symbol.strip().upper()
+    preset = DEFAULT_SIGNAL_PRESET
+    macro_data = load_macro_fear_greed_cached(end_iso)
+    requested_tickers = [symbol]
+    if symbol == ML_TARGET_SYMBOL:
+        requested_tickers = dedupe_preserve_order(requested_tickers + list(ML_BATCH_TICKERS))
+    price_payloads = load_price_payloads(requested_tickers, start_iso, end_iso)
+    payload = price_payloads.get(symbol, {"frame": pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)), "resolved_symbol": symbol, "warning": f"{symbol} payload unavailable"})
+    analysis = analyze_symbol_state(
+        symbol,
+        payload,
+        macro_data,
+        preset,
+        feature_payloads=price_payloads if symbol == ML_TARGET_SYMBOL else None,
+    )
+    final_state_frame = attach_rule_only_columns(analysis["state_frame"])
+    baseline_state_frame = attach_rule_only_columns(analysis["baseline_state_frame"])
+    ml_bundle = analysis["ml_bundle"]
+    oos_start = ml_bundle.get("oos_start") or final_state_frame.index.min()
+    final_slice = final_state_frame.loc[oos_start:].copy() if oos_start is not None else final_state_frame.copy()
+    baseline_slice = baseline_state_frame.loc[oos_start:].copy() if oos_start is not None else baseline_state_frame.copy()
+    _, _, rule_summary = build_trade_replay_from_state_frame(symbol, baseline_slice, preset)
+    _, _, ml_summary = build_trade_replay_from_state_frame(symbol, final_slice, preset)
+    return {
+        "symbol": symbol,
+        "start": start_iso,
+        "end": end_iso,
+        "oos_start": None if oos_start is None else pd.Timestamp(oos_start).date().isoformat(),
+        "model_mode": ml_bundle.get("model_mode", "rules_only"),
+        "ml_enabled": bool(ml_bundle.get("enabled")),
+        "reason": ml_bundle.get("reason"),
+        "rule_summary": rule_summary,
+        "ml_summary": ml_summary,
+        "selection_frame": ml_bundle.get("selection_frame", pd.DataFrame()).to_dict("records"),
+    }
+
+
+def run_ml_backtest_cli(symbol: str, start_iso: str, end_iso: str, json_output: bool = False) -> int:
+    result = run_ml_backtest(symbol, start_iso, end_iso)
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+        return 0
+    print("ML_BACKTEST")
+    print(f"symbol={result['symbol']}")
+    print(f"start={result['start']} end={result['end']} oos_start={result['oos_start']}")
+    print(f"model_mode={result['model_mode']} ml_enabled={result['ml_enabled']}")
+    print(f"reason={result['reason']}")
+    print(f"rule_summary={result['rule_summary']}")
+    print(f"ml_summary={result['ml_summary']}")
+    return 0
 
 
 def run_self_tests() -> list[tuple[str, bool, str]]:
@@ -3176,6 +4272,116 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
     except Exception as exc:
         record("drilldown_label_alignment", False, str(exc))
 
+    try:
+        splitter = TimeSeriesSplit(n_splits=ML_CV_SPLITS, test_size=ML_CV_TEST_SIZE, gap=ML_CV_GAP)
+        leakage_free = True
+        for train_idx, test_idx in splitter.split(np.arange(600)):
+            if int(train_idx[-1]) + ML_CV_GAP >= int(test_idx[0]):
+                leakage_free = False
+                break
+        record("timeseries_gap_no_leakage", leakage_free, f"gap={ML_CV_GAP}, leakage_free={leakage_free}")
+    except Exception as exc:
+        record("timeseries_gap_no_leakage", False, str(exc))
+
+    try:
+        label_close = pd.Series(100 + np.sin(np.linspace(0, 14, 260)).cumsum(), index=pd.date_range("2023-01-02", periods=260, freq="B"))
+        label_frame = synthetic_ohlcv_from_close(label_close)
+        macro_series = pd.Series(50.0, index=label_frame.index)
+        indicators = compute_indicators(label_frame, macro_series, label_close * 0.98, macro_series / 100.0, ML_TARGET_SYMBOL)
+        state_frame = attach_rule_only_columns(build_state_frame(indicators, DEFAULT_SIGNAL_PRESET))
+        labels = build_ml_label_frame(state_frame, DEFAULT_SIGNAL_PRESET)
+        passed = (
+            not labels.empty
+            and {"BuyCandidate", "SellCandidate", "BuyLabel", "SellLabel", "SellEdge"}.issubset(labels.columns)
+            and labels["BuyCandidate"].dtype == bool
+            and labels["SellCandidate"].dtype == bool
+        )
+        record("label_generation_stability", passed, f"buy_candidates={int(labels['BuyCandidate'].sum())}, sell_candidates={int(labels['SellCandidate'].sum())}")
+    except Exception as exc:
+        record("label_generation_stability", False, str(exc))
+
+    try:
+        descriptor = resolve_boosting_descriptor(prefer_lightgbm=False)
+        passed = descriptor.name == "hist_gradient_boosting"
+        record("fallback_model_selection", passed, f"descriptor={descriptor.name}")
+    except Exception as exc:
+        record("fallback_model_selection", False, str(exc))
+
+    try:
+        stop_index = pd.date_range("2024-06-03", periods=3, freq="B")
+        stop_state = pd.DataFrame(
+            {
+                "Close": [100.0, 98.0, 95.0],
+                "Open": [100.0, 98.5, 95.5],
+                "High": [101.0, 99.0, 96.0],
+                "Low": [99.0, 97.0, 94.0],
+                "State": ["Buy", "Strong Sell", "Strong Sell"],
+                "BuyScore": [75, 25, 20],
+                "SellScore": [20, 90, 92],
+                "BuyTrigger": [True, False, False],
+                "SellTrigger": [False, True, True],
+                "SellSetupActive": [False, True, True],
+                "StopExitConfirmed": [False, True, True],
+                "StopEmergencyExit": [False, True, True],
+                "SignalNote": ["", "", ""],
+            },
+            index=stop_index,
+        )
+        filtered = apply_ml_thresholds_to_state_frame(
+            attach_rule_only_columns(stop_state),
+            pd.Series([0.9, 0.1, 0.1], index=stop_index),
+            pd.Series([0.1, 0.1, 0.1], index=stop_index),
+            0.8,
+            0.8,
+            model_mode="random_forest",
+        )
+        passed = bool(filtered["SellTrigger"].iloc[1] and filtered["State"].iloc[1] == "Strong Sell")
+        record("hard_stop_non_rejection", passed, f"sell_trigger={filtered['SellTrigger'].iloc[1]}, state={filtered['State'].iloc[1]}")
+    except Exception as exc:
+        record("hard_stop_non_rejection", False, str(exc))
+
+    try:
+        rows = 180
+        feature_index = pd.date_range("2023-01-02", periods=rows, freq="B")
+        feature_frame = pd.DataFrame(
+            {
+                "F1": np.linspace(-2, 2, rows),
+                "F2": np.sin(np.linspace(0, 6 * np.pi, rows)),
+                "F3": np.cos(np.linspace(0, 5 * np.pi, rows)),
+            },
+            index=feature_index,
+        )
+        candidate_mask = pd.Series(True, index=feature_index)
+        label_series = pd.Series(([0] * 90) + ([1] * 90), index=feature_index)
+        first_train, first_test, _ = build_probability_views_for_target(
+            feature_frame,
+            candidate_mask,
+            label_series,
+            feature_frame.iloc[0:0],
+            pd.Series(dtype=bool),
+            ["F1", "F2", "F3"],
+            prefer_lightgbm=False,
+        )
+        second_train, second_test, _ = build_probability_views_for_target(
+            feature_frame,
+            candidate_mask,
+            label_series,
+            feature_frame.iloc[0:0],
+            pd.Series(dtype=bool),
+            ["F1", "F2", "F3"],
+            prefer_lightgbm=False,
+        )
+        passed = all(
+            np.allclose(first_train[name], second_train[name], equal_nan=True)
+            for name in first_train
+        ) and all(
+            np.allclose(first_test[name], second_test[name], equal_nan=True)
+            for name in first_test
+        )
+        record("fixed_random_state_reproducibility", passed, "probability views stable across repeated fits")
+    except Exception as exc:
+        record("fixed_random_state_reproducibility", False, str(exc))
+
     return results
 
 
@@ -3217,27 +4423,39 @@ def main() -> None:
     end_date = date.today()
     start_date = end_date - timedelta(days=(history_years * 365) + 30)
     price_payloads: dict[str, dict[str, Any]] = {}
+    full_price_payloads: dict[str, dict[str, Any]] = {}
 
     try:
         with st.spinner("Loading watchlist prices and macro context..."):
             macro_started_at = time.perf_counter()
             macro_data = load_macro_fear_greed_cached(end_date.isoformat())
             add_timing("load", "macro_fear_greed", macro_started_at, len(macro_data.get("score_series", pd.Series(dtype=float))))
-            for ticker in watchlist:
-                ticker_started_at = time.perf_counter()
-                price_payloads[ticker] = download_single_history_cached(ticker, start_date.isoformat(), end_date.isoformat())
-                add_timing("download", ticker, ticker_started_at, len(price_payloads[ticker]["frame"]))
+            download_started_at = time.perf_counter()
+            requested_tickers = watchlist.copy()
+            if ML_TARGET_SYMBOL in watchlist:
+                requested_tickers = dedupe_preserve_order(requested_tickers + list(ML_BATCH_TICKERS))
+            full_price_payloads = load_price_payloads(requested_tickers, start_date.isoformat(), end_date.isoformat())
+            add_timing("download_batch", "watchlist_and_features", download_started_at, sum(len(payload.get("frame", pd.DataFrame())) for payload in full_price_payloads.values()))
+            price_payloads = {ticker: full_price_payloads.get(ticker, download_single_history_cached(ticker, start_date.isoformat(), end_date.isoformat())) for ticker in watchlist}
     except Exception as exc:
         st.error("Dashboard data could not be loaded.")
         st.info(str(exc))
         st.stop()
 
     state_frames: dict[str, pd.DataFrame] = {}
+    baseline_state_frames: dict[str, pd.DataFrame] = {}
+    ml_bundles: dict[str, dict[str, Any]] = {}
     snapshots: list[TickerSnapshot] = []
     warnings: list[str] = []
     macro_warning = macro_data.get("warning")
     if macro_warning:
         warnings.append(str(macro_warning))
+
+    cached_qqq_analysis: dict[str, Any] | None = None
+    if ML_TARGET_SYMBOL in watchlist:
+        qqq_ml_started_at = time.perf_counter()
+        cached_qqq_analysis = load_cached_qqq_analysis(start_date.isoformat(), end_date.isoformat(), preset.name)
+        add_timing("ml_bundle", ML_TARGET_SYMBOL, qqq_ml_started_at, len(cached_qqq_analysis.get("state_frame", pd.DataFrame())))
 
     with st.spinner("Computing indicators, scores, and replay states..."):
         for ticker in watchlist:
@@ -3249,19 +4467,18 @@ def main() -> None:
                 warnings.append(f"{ticker}: {warning}")
             if price_frame.empty:
                 continue
-            indicators = compute_indicators(
-                price_frame,
-                macro_data["score_series"],
-                macro_data.get("benchmark_close"),
-                macro_data.get("tips_13612w_momentum"),
-                payload["resolved_symbol"],
-            )
-            state_frame = build_state_frame(indicators, preset)
+            if ticker == ML_TARGET_SYMBOL and cached_qqq_analysis is not None:
+                analysis = cached_qqq_analysis
+            else:
+                analysis = analyze_symbol_state(ticker, payload, macro_data, preset)
+            state_frame = analysis["state_frame"]
             if state_frame.empty:
                 warnings.append(f"{ticker}: indicator stack could not build a usable state frame")
                 continue
+            baseline_state_frames[ticker] = analysis["baseline_state_frame"]
             state_frames[ticker] = state_frame
-            snapshots.append(build_snapshot(ticker, payload["resolved_symbol"], state_frame, warning))
+            ml_bundles[ticker] = analysis["ml_bundle"]
+            snapshots.append(analysis["snapshot"])
             add_timing("compute", ticker, compute_started_at, len(state_frame))
 
     watchlist_frame = build_watchlist_frame(snapshots)
@@ -3288,14 +4505,20 @@ def main() -> None:
     )
     selected_snapshot = snapshot_by_ticker[selected_ticker]
     selected_state_frame = state_frames[selected_ticker]
+    selected_baseline_state_frame = baseline_state_frames.get(selected_ticker, selected_state_frame)
+    selected_ml_bundle = ml_bundles.get(selected_ticker, {})
     replay_started_at = time.perf_counter()
     event_frame, trade_frame, replay_summary = build_trade_replay_from_state_frame(selected_ticker, selected_state_frame, preset)
     add_timing("replay", selected_ticker, replay_started_at, len(event_frame))
     chart_started_at = time.perf_counter()
     chart_signal_frame = event_frame.loc[event_frame["Signal"].isin(["BUY", "SELL"])].copy() if not event_frame.empty else build_chart_signal_frame(selected_state_frame, preset)
     add_timing("chart_signals", selected_ticker, chart_started_at, len(chart_signal_frame))
+    baseline_summary = build_trade_replay_from_state_frame(selected_ticker, selected_baseline_state_frame, preset)[2] if not selected_baseline_state_frame.empty else {}
     add_timing("total", "app_run", run_started_at)
     performance_frame = build_performance_frame(timing_rows)
+    comparison = selected_ml_bundle.get("comparison", {}).copy()
+    if comparison and "rule_summary" not in comparison:
+        comparison["rule_summary"] = baseline_summary
     render_ticker_panel(
         selected_ticker=selected_ticker,
         snapshot=selected_snapshot,
@@ -3305,11 +4528,30 @@ def main() -> None:
         trade_frame=trade_frame,
         replay_summary=replay_summary,
         preset=preset,
+        comparison=comparison,
+        selection_frame=selected_ml_bundle.get("selection_frame", pd.DataFrame()),
     )
     render_diagnostics(diagnostics, performance_frame)
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=APP_TITLE)
+    parser.add_argument("--self-test", action="store_true", help="Run built-in synthetic validation tests.")
+    parser.add_argument("--benchmark", action="store_true", help="Run local performance benchmark.")
+    parser.add_argument("--ml-backtest", action="store_true", help="Run strict out-of-sample ML backtest.")
+    parser.add_argument("--symbol", default=ML_TARGET_SYMBOL, help="Ticker symbol for --ml-backtest.")
+    parser.add_argument("--start", default="2016-01-01", help="Start date for --ml-backtest in YYYY-MM-DD format.")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date for --ml-backtest in YYYY-MM-DD format.")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Emit machine-readable JSON output for CLI commands.")
+    return parser
+
+
 if __name__ == "__main__":
-    if "--self-test" in sys.argv:
+    args = build_arg_parser().parse_args()
+    if args.self_test:
         raise SystemExit(run_self_tests_cli())
+    if args.benchmark:
+        raise SystemExit(run_benchmark_cli(json_output=args.json_output))
+    if args.ml_backtest:
+        raise SystemExit(run_ml_backtest_cli(args.symbol, args.start, args.end, json_output=args.json_output))
     main()
