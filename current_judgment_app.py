@@ -116,6 +116,27 @@ PROFILE_PRESETS = {
     "Balanced": SignalPreset(name="Balanced", strong_threshold=70, watch_threshold=56, cooldown_bars=4),
     "Conservative": SignalPreset(name="Conservative", strong_threshold=74, watch_threshold=60, cooldown_bars=6),
 }
+DEFAULT_SIGNAL_PRESET = PROFILE_PRESETS["Balanced"]
+
+BUY_COMPONENT_WEIGHTS: dict[str, float] = {
+    "reversion": 1.00,
+    "td": 1.00,
+    "macro": 1.00,
+    "relative": 1.00,
+    "volume": 1.00,
+    "macd": 1.00,
+    "regime": 1.00,
+    "confluence": 1.00,
+    "confirmation": 1.00,
+}
+
+SELL_COMPONENT_WEIGHTS: dict[str, float] = {
+    "exhaustion": 1.00,
+    "td": 1.00,
+    "heat": 1.00,
+    "distribution": 1.00,
+    "confluence": 1.00,
+}
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -251,6 +272,10 @@ def format_snapshot_label(snapshot: TickerSnapshot) -> str:
     return f"{snapshot.ticker} ({resolved})"
 
 
+def weighted_component(score: float, weight: float) -> float:
+    return score * weight
+
+
 def compute_stop_breach_metrics(
     close_value: float | None,
     stop_value: float | None,
@@ -337,7 +362,7 @@ def calc_13612w_momentum(series: pd.Series) -> pd.Series:
 
 
 def build_controls() -> tuple[list[str], int, SignalPreset, bool]:
-    st.sidebar.subheader("Dashboard Controls")
+    st.sidebar.subheader("Analysis Controls")
     watchlist_raw = st.sidebar.text_area(
         "Watchlist tickers",
         value=", ".join(DEFAULT_WATCHLIST),
@@ -345,15 +370,14 @@ def build_controls() -> tuple[list[str], int, SignalPreset, bool]:
         height=96,
     )
     history_years = st.sidebar.slider("History lookback (years)", min_value=1, max_value=5, value=3, step=1)
-    profile_name = st.sidebar.selectbox("Signal profile", options=list(PROFILE_PRESETS), index=1)
     refresh = st.sidebar.button("Refresh cached data", width="stretch")
-    st.sidebar.caption("Daily-bar swing dashboard optimized for SPY, QQQ, and KODEX 200 only.")
+    st.sidebar.caption("Balanced tuned mode only. SPY, QQQ, and KODEX 200 are the only supported assets.")
 
     parsed_watchlist = parse_tickers(watchlist_raw)
     watchlist = [ticker for ticker in parsed_watchlist if ticker in OPTIMIZED_TICKER_SET]
     if not watchlist:
         watchlist = list(DEFAULT_WATCHLIST)
-    return watchlist, int(history_years), PROFILE_PRESETS[profile_name], refresh
+    return watchlist, int(history_years), DEFAULT_SIGNAL_PRESET, refresh
 
 
 def normalize_datetime_index(index: Any) -> pd.DatetimeIndex:
@@ -706,6 +730,20 @@ def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
     return macd_line, signal_line, hist
 
 
+def calc_cmf(frame: pd.DataFrame, period: int = 20) -> pd.Series:
+    high_low_range = (frame["High"] - frame["Low"]).replace(0.0, np.nan)
+    money_flow_multiplier = (((frame["Close"] - frame["Low"]) - (frame["High"] - frame["Close"])) / high_low_range).fillna(0.0)
+    money_flow_volume = money_flow_multiplier * pd.to_numeric(frame["Volume"], errors="coerce").fillna(0.0)
+    volume_sum = pd.to_numeric(frame["Volume"], errors="coerce").rolling(period, min_periods=period).sum()
+    return money_flow_volume.rolling(period, min_periods=period).sum() / volume_sum.replace(0.0, np.nan)
+
+
+def calc_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    direction = pd.Series(np.sign(close.diff().fillna(0.0)), index=close.index)
+    signed_volume = direction * pd.to_numeric(volume, errors="coerce").fillna(0.0)
+    return signed_volume.cumsum()
+
+
 def calc_bb_position(series: pd.Series, period: int = 20, stdev: float = 2.0) -> pd.Series:
     basis = series.rolling(period, min_periods=period).mean()
     dev = series.rolling(period, min_periods=period).std()
@@ -921,6 +959,9 @@ def compute_indicators(
     work["RSI"] = calc_rsi(work["Close"], period=14)
     work["ATR"] = calc_atr(work, period=14)
     work["MFI"] = calc_mfi(work, period=14)
+    work["CMF20"] = calc_cmf(work, period=20)
+    work["OBV"] = calc_obv(work["Close"], work["Volume"])
+    work["OBVSlope10"] = work["OBV"] - work["OBV"].shift(10)
     plus_di, minus_di, adx = calc_adx(work, period=14)
     macd_line, macd_signal, macd_hist = calc_macd(work["Close"])
     work["PlusDI"] = plus_di
@@ -930,13 +971,25 @@ def compute_indicators(
     work["MACDSignal"] = macd_signal
     work["MACDHist"] = macd_hist
     work["MACDHistDelta"] = work["MACDHist"].diff()
+    work["MACDBullCross"] = (work["MACDLine"] > work["MACDSignal"]) & (work["MACDLine"].shift(1) <= work["MACDSignal"].shift(1))
+    work["MACDBearCross"] = (work["MACDLine"] < work["MACDSignal"]) & (work["MACDLine"].shift(1) >= work["MACDSignal"].shift(1))
+    bb_basis20 = work["Close"].rolling(20, min_periods=20).mean()
+    bb_std20 = work["Close"].rolling(20, min_periods=20).std()
+    bb_upper20 = bb_basis20 + (2.0 * bb_std20)
+    bb_lower20 = bb_basis20 - (2.0 * bb_std20)
     work["BBPos20"] = calc_bb_position(work["Close"], period=20, stdev=2.0)
+    work["BBWidth20"] = (bb_upper20 - bb_lower20) / bb_basis20.replace(0.0, np.nan)
+    work["BBWidthPct"] = rolling_percentile(work["BBWidth20"], window=252, min_periods=63) * 100.0
     work["ChandelierStop"] = work["High"].rolling(22, min_periods=22).max() - (3.0 * work["ATR"])
     work["ATRStretch"] = (work["Close"] - work["EMA20"]) / work["ATR"].replace(0, np.nan)
     work["StopDistance"] = (work["Close"] / work["ChandelierStop"]) - 1.0
     work["EMA50Slope20"] = work["EMA50"] - work["EMA50"].shift(20)
     work["VolumeSMA20"] = pd.to_numeric(work["Volume"], errors="coerce").rolling(20, min_periods=20).mean()
     work["VolumeRatio20"] = pd.to_numeric(work["Volume"], errors="coerce") / work["VolumeSMA20"].replace(0.0, np.nan)
+    work["VolumePct20"] = rolling_percentile(work["VolumeRatio20"], window=252, min_periods=63) * 100.0
+    work["VolumeClimaxUp"] = (work["VolumeRatio20"] >= 1.35) & (work["Close"] >= work["Open"])
+    work["VolumeClimaxDown"] = (work["VolumeRatio20"] >= 1.35) & (work["Close"] < work["Open"])
+    work["VolumeDryUp"] = (work["VolumeRatio20"] <= 0.72).fillna(False)
     work["MFIChange5"] = work["MFI"] - work["MFI"].shift(5)
     work["BuyTriggerPrice"] = work["Close"] > work["High"].shift(1)
     work["SellTriggerPrice"] = work["Close"] < work["Low"].shift(1)
@@ -1050,24 +1103,60 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     rs_percentile = _coerce_float(row.get("RSPercentile"))
     rs_momentum = _coerce_float(row.get("RSMomentum63"))
     volume_ratio = _coerce_float(row.get("VolumeRatio20"))
+    cmf20 = _coerce_float(row.get("CMF20"))
+    obv_slope10 = _coerce_float(row.get("OBVSlope10"))
     macd_hist = _coerce_float(row.get("MACDHist"))
     macd_delta = _coerce_float(row.get("MACDHistDelta"))
+    macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
+    macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
     bb_pos = _coerce_float(row.get("BBPos20"))
+    bb_width_pct = _coerce_float(row.get("BBWidthPct"))
+    volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
+    volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
+    volume_dry_up = _coerce_bool(row.get("VolumeDryUp"))
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
     ema20 = _coerce_float(row.get("EMA20"))
 
     deep_reversal = cycle_score is not None and cycle_score <= 15 and buy_countdown == 13
     oversold_cluster = False
+    dryup_reversal = bool(
+        volume_dry_up
+        and cycle_score is not None
+        and cycle_score <= 25
+        and rsi is not None
+        and rsi <= 44
+    )
+    accumulation_flow = bool(
+        volume_climax_up
+        or (
+            cmf20 is not None
+            and cmf20 >= 0.05
+            and obv_slope10 is not None
+            and obv_slope10 > 0
+        )
+    )
+    distribution_pressure = bool(
+        volume_climax_down
+        or (
+            cmf20 is not None
+            and cmf20 <= -0.05
+            and obv_slope10 is not None
+            and obv_slope10 < 0
+        )
+    )
     volume_support = bool(
         (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
         or (mfi_change is not None and mfi_change >= 5.0)
+        or accumulation_flow
+        or dryup_reversal
     )
     relative_support = bool(
         (rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
         or (rs_momentum is not None and rs_momentum >= (-0.03 if reference_asset else -0.01))
     )
     tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
+    chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
 
     reversion_score = 0.0
     if cycle_score is not None:
@@ -1141,7 +1230,8 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     reversion_cap = 28 if regime == "Range / Transition" else 24 if bull_regime else 20
     if reference_asset:
         reversion_cap += 8
-    score += min(reversion_cap, reversion_score)
+    reversion_score = min(reversion_cap, reversion_score)
+    score += weighted_component(reversion_score, BUY_COMPONENT_WEIGHTS["reversion"])
 
     td_score = 0.0
     if buy_countdown == 13:
@@ -1156,86 +1246,117 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     elif reference_asset and buy_setup >= 5 and cycle_score is not None and cycle_score <= 35:
         td_score = 8
         reasons.append(f"TD early buy setup {buy_setup}")
-    score += td_score
+    score += weighted_component(td_score, BUY_COMPONENT_WEIGHTS["td"])
 
-    context_score = 0.0
+    macro_score = 0.0
     if fear_greed is not None:
         if fear_greed <= 30:
-            context_score += 8
+            macro_score += 8
             reasons.append("Macro fear tailwind")
         elif fear_greed <= 45:
-            context_score += 4
+            macro_score += 4
             reasons.append("Macro risk reset")
     if tips_risk_off:
         if deep_reversal:
-            context_score -= 2
+            macro_score -= 2
         elif tips_momentum is not None and tips_momentum <= -0.03:
-            context_score -= 8
+            macro_score -= 8
             reasons.append("TIPS 13612W risk-off")
         else:
-            context_score -= 5
+            macro_score -= 5
             reasons.append("TIPS macro headwind")
+    score += weighted_component(macro_score, BUY_COMPONENT_WEIGHTS["macro"])
 
+    relative_score = 0.0
     if relative_support:
-        context_score += 8 if rs_percentile is not None and rs_percentile >= 60 else 5
+        relative_score += 8 if rs_percentile is not None and rs_percentile >= 60 else 5
         reasons.append("Relative strength supportive")
     elif rs_percentile is not None and rs_percentile < 25:
-        context_score -= 10
+        relative_score -= 10
         reasons.append("Relative strength weak")
     elif rs_percentile is not None and rs_percentile < 40:
-        context_score -= 4
+        relative_score -= 4
+    score += weighted_component(relative_score, BUY_COMPONENT_WEIGHTS["relative"])
 
-    if volume_support:
-        context_score += 8
+    volume_score = 0.0
+    if accumulation_flow:
+        volume_score += 9
+        reasons.append("Accumulation flow")
+    elif dryup_reversal:
+        volume_score += 5
+        reasons.append("Volume dry-up reset")
+    elif volume_support:
+        volume_score += 7
         reasons.append("Volume-backed reversal")
     elif mfi is not None and mfi < 25 and mfi_change is not None and mfi_change < 0 and bear_regime:
-        context_score -= 8
+        volume_score -= 8
         reasons.append("Falling knife flow")
+    if distribution_pressure and not deep_reversal:
+        volume_score -= 8
+        reasons.append("Distribution pressure")
+    score += weighted_component(volume_score, BUY_COMPONENT_WEIGHTS["volume"])
 
-    if macd_delta is not None:
+    macd_score = 0.0
+    if macd_bull_cross:
+        macd_score += 12 if macd_hist is not None and macd_hist <= 0 else 9
+        reasons.append("MACD bullish cross")
+    elif macd_delta is not None:
         if macd_delta > 0 and macd_hist is not None and macd_hist <= 0:
-            context_score += 8
+            macd_score += 8
             reasons.append("MACD momentum turn")
         elif macd_delta > 0 and macd_hist is not None and macd_hist > 0:
-            context_score += 10
+            macd_score += 10
             reasons.append("MACD bullish expansion")
         elif macd_delta < 0 and bear_regime and not deep_reversal:
-            context_score -= 5
+            macd_score -= 5
             reasons.append("MACD still falling")
+    if macd_bear_cross and not deep_reversal:
+        macd_score -= 6
+        reasons.append("MACD bear cross")
+    score += weighted_component(macd_score, BUY_COMPONENT_WEIGHTS["macd"])
+
+    regime_score = 0.0
+    if chop_zone:
+        if macd_bull_cross or accumulation_flow or deep_reversal:
+            regime_score += 3
+            reasons.append("Squeeze reversal support")
+        else:
+            regime_score -= 7
+            reasons.append("Bollinger squeeze chop")
 
     if bull_regime:
-        context_score += 8
+        regime_score += 8
         reasons.append("Bull regime support")
     elif regime == "Range / Transition":
-        context_score += 3
+        regime_score += 3
     elif not deep_reversal:
-        context_score -= 6 if reference_asset else 12
+        regime_score -= 6 if reference_asset else 12
         reasons.append("Bear regime penalty")
 
     if bull_regime and atr_stretch is not None and atr_stretch <= -0.5 and close_value is not None and ema20 is not None and close_value >= ema20:
-        context_score += 6
+        regime_score += 6
         reasons.append("Trend dip setup")
-
-    score += context_score
+    score += weighted_component(regime_score, BUY_COMPONENT_WEIGHTS["regime"])
 
     confluence_count = int(sum(
         [
             bool(cycle_score is not None and cycle_score <= 35),
             bool(buy_setup >= 8 or buy_countdown == 13),
             oversold_cluster,
-            volume_support,
+            accumulation_flow or volume_support,
             relative_support,
             bool(fear_greed is not None and fear_greed <= 45),
             bull_regime,
+            macd_bull_cross,
         ]
     ))
     if confluence_count >= 3:
         confluence_bonus = min(20.0, 6.0 + ((confluence_count - 3) * 4.0))
-        score += confluence_bonus
+        score += weighted_component(confluence_bonus, BUY_COMPONENT_WEIGHTS["confluence"])
         reasons.append(f"{confluence_count}x buy confluence")
 
     if _coerce_bool(row.get("BuyTriggerPrice")):
-        score += 6
+        score += weighted_component(6.0, BUY_COMPONENT_WEIGHTS["confirmation"])
         reasons.append("Price confirmation")
 
     if bear_regime and not deep_reversal:
@@ -1263,9 +1384,16 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     rs_percentile = _coerce_float(row.get("RSPercentile"))
     rs_momentum = _coerce_float(row.get("RSMomentum63"))
     volume_ratio = _coerce_float(row.get("VolumeRatio20"))
+    cmf20 = _coerce_float(row.get("CMF20"))
+    obv_slope10 = _coerce_float(row.get("OBVSlope10"))
     macd_hist = _coerce_float(row.get("MACDHist"))
     macd_delta = _coerce_float(row.get("MACDHistDelta"))
+    macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
+    macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
     bb_pos = _coerce_float(row.get("BBPos20"))
+    bb_width_pct = _coerce_float(row.get("BBWidthPct"))
+    volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
+    volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
     stop_touched = _coerce_bool(row.get("StopTouched"))
@@ -1280,6 +1408,20 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         )
     )
     tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
+    accumulation_support = bool(
+        (cmf20 is not None and cmf20 >= 0.05 and obv_slope10 is not None and obv_slope10 > 0)
+        or volume_climax_up
+    )
+    blowoff_risk = bool(
+        volume_climax_up
+        and bb_pos is not None
+        and bb_pos >= 0.90
+        and (
+            (rsi is not None and rsi >= 66)
+            or (atr_stretch is not None and atr_stretch >= 1.1)
+        )
+    )
+    chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
 
     exhaustion_score = 0.0
     if cycle_score is not None:
@@ -1292,7 +1434,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif cycle_score >= 60:
             exhaustion_score += 7
             reasons.append("STL rich")
-    score += exhaustion_score
+    score += weighted_component(exhaustion_score, SELL_COMPONENT_WEIGHTS["exhaustion"])
 
     td_score = 0.0
     if sell_countdown == 13:
@@ -1304,7 +1446,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     elif sell_setup >= 7:
         td_score = 8
         reasons.append(f"TD sell setup {sell_setup}")
-    score += td_score
+    score += weighted_component(td_score, SELL_COMPONENT_WEIGHTS["td"])
 
     heat_score = 0.0
     heat_signal = False
@@ -1350,16 +1492,27 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             heat_signal = True
             reasons.append("Bollinger hot-zone")
 
-    score += min(18.0, heat_score)
+    heat_score = min(18.0, heat_score)
+    score += weighted_component(heat_score, SELL_COMPONENT_WEIGHTS["heat"])
 
     distribution_score = 0.0
     distribution_flow = bool(
         (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value < open_value)
         or (mfi_change is not None and mfi_change <= -5.0 and mfi is not None and mfi >= 60.0)
+        or volume_climax_down
+        or (
+            cmf20 is not None
+            and cmf20 <= -0.05
+            and obv_slope10 is not None
+            and obv_slope10 < 0
+        )
     )
     if distribution_flow:
         distribution_score += 8
         reasons.append("Distribution flow")
+    if blowoff_risk:
+        distribution_score += 6
+        reasons.append("Blowoff volume")
     if fear_greed is not None:
         if fear_greed >= 70:
             distribution_score += 8
@@ -1381,13 +1534,19 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         distribution_score += 4
     if rs_momentum is not None and rs_momentum <= -0.03:
         distribution_score += 6
-    if macd_delta is not None:
+    if macd_bear_cross:
+        distribution_score += 10 if macd_hist is not None and macd_hist >= 0 else 8
+        reasons.append("MACD bear cross")
+    elif macd_delta is not None:
         if macd_delta < 0 and macd_hist is not None and macd_hist <= 0:
             distribution_score += 8
             reasons.append("MACD breakdown")
         elif macd_delta < 0 and macd_hist is not None and macd_hist > 0:
             distribution_score += 4
             reasons.append("MACD rollover")
+    if macd_bull_cross and bull_regime and not stop_close_breach:
+        distribution_score -= 6
+        reasons.append("MACD support")
     if sell_trigger_price:
         distribution_score += 12
         reasons.append("Price breakdown")
@@ -1400,7 +1559,17 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     if bear_regime:
         distribution_score += 12
         reasons.append("Bear regime pressure")
-    score += distribution_score
+    if accumulation_support and not stop_close_breach and not bear_regime:
+        distribution_score -= 6
+        reasons.append("Accumulation support")
+    if chop_zone:
+        if distribution_flow or macd_bear_cross or stop_close_breach:
+            distribution_score += 3
+            reasons.append("Squeeze breakdown risk")
+        else:
+            distribution_score -= 7
+            reasons.append("Bollinger squeeze chop")
+    score += weighted_component(distribution_score, SELL_COMPONENT_WEIGHTS["distribution"])
 
     confluence_count = int(sum(
         [
@@ -1411,11 +1580,12 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             sell_trigger_price,
             stop_close_breach,
             bear_regime,
+            macd_bear_cross,
         ]
     ))
     if confluence_count >= 3:
         confluence_bonus = min(16.0, 5.0 + ((confluence_count - 3) * 3.0))
-        score += confluence_bonus
+        score += weighted_component(confluence_bonus, SELL_COMPONENT_WEIGHTS["confluence"])
         reasons.append(f"{confluence_count}x sell confluence")
 
     if bull_regime and not stop_close_breach and not sell_trigger_price:
@@ -1448,7 +1618,16 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
     rs_percentile = _coerce_float(row.get("RSPercentile"))
     volume_ratio = _coerce_float(row.get("VolumeRatio20"))
+    cmf20 = _coerce_float(row.get("CMF20"))
+    obv_slope10 = _coerce_float(row.get("OBVSlope10"))
     mfi_change = _coerce_float(row.get("MFIChange5"))
+    macd_delta = _coerce_float(row.get("MACDHistDelta"))
+    macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
+    macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
+    bb_width_pct = _coerce_float(row.get("BBWidthPct"))
+    volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
+    volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
+    volume_dry_up = _coerce_bool(row.get("VolumeDryUp"))
     stop_touched = _coerce_bool(row.get("StopTouched"))
     stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
     stop_price = _coerce_float(row.get("ChandelierStop"))
@@ -1467,13 +1646,42 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
             or (cycle_score <= 25 and rsi <= 35)
         )
     )
+    dryup_reversal = bool(
+        volume_dry_up
+        and cycle_score is not None
+        and cycle_score <= 25
+        and rsi is not None
+        and rsi <= 44
+    )
+    accumulation_flow = bool(
+        volume_climax_up
+        or (
+            cmf20 is not None
+            and cmf20 >= 0.03
+            and obv_slope10 is not None
+            and obv_slope10 > 0
+        )
+    )
+    distribution_flow = bool(
+        volume_climax_down
+        or (
+            cmf20 is not None
+            and cmf20 <= -0.03
+            and obv_slope10 is not None
+            and obv_slope10 < 0
+        )
+    )
+    flow_conflict = distribution_flow and not accumulation_flow
     volume_support = bool(
         (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
         or (mfi_change is not None and mfi_change >= 5.0)
+        or accumulation_flow
+        or dryup_reversal
     )
     relative_support = bool(rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
     bullish_close = bool(close_value is not None and open_value is not None and close_value >= open_value)
     tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
+    chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
 
     buy_setup_threshold = preset.watch_threshold
     if bull_regime and relative_support:
@@ -1482,11 +1690,18 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         buy_setup_threshold -= 5
     if tips_risk_off and not deep_reversal:
         buy_setup_threshold += 2
+    if chop_zone and not (macd_bull_cross or accumulation_flow or deep_reversal):
+        buy_setup_threshold += 3
+    if flow_conflict and not deep_reversal:
+        buy_setup_threshold += 4
     buy_setup_active = (
         (buy_score >= buy_setup_threshold and (buy_score >= sell_score - 10 or deep_reversal))
         or (reference_asset and cycle_score is not None and rsi is not None and cycle_score <= 20 and rsi <= 45)
     )
-    sell_setup_active = sell_score >= (preset.watch_threshold + (4 if reference_asset else 0)) and sell_score >= buy_score - 4 and not panic_low
+    sell_setup_threshold = preset.watch_threshold + (4 if reference_asset else 0)
+    if chop_zone and not (macd_bear_cross or distribution_flow or stop_close_breach):
+        sell_setup_threshold += 3
+    sell_setup_active = sell_score >= sell_setup_threshold and sell_score >= buy_score - 4 and not panic_low
     stop_exit_confirmed, stop_emergency_exit, stop_gap_atr = evaluate_stop_exit(
         close_value,
         stop_price,
@@ -1501,24 +1716,35 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     buy_trigger = bool(
         buy_setup_active
         and not stop_exit_confirmed
+        and (not chop_zone or macd_bull_cross or accumulation_flow or deep_reversal or buy_trigger_price)
+        and (not flow_conflict or deep_reversal or macd_bull_cross)
         and (
             buy_trigger_price
+            or macd_bull_cross
             or (deep_reversal and bullish_close and (volume_support or relative_support))
             or (
                 close_up_day
                 and buy_score >= max(preset.watch_threshold + 4, sell_score + 6)
-                and (volume_support or deep_reversal or bull_regime)
+                and (
+                    accumulation_flow
+                    or (volume_support and not flow_conflict)
+                    or deep_reversal
+                    or bull_regime
+                    or (macd_delta is not None and macd_delta > 0)
+                )
             )
-            or (bull_regime and buy_score >= max(preset.watch_threshold, preset.strong_threshold - 8) and bullish_close and volume_support)
+            or (bull_regime and buy_score >= max(preset.watch_threshold, preset.strong_threshold - 8) and bullish_close and volume_support and not flow_conflict)
         )
     )
     sell_trigger = bool(
         stop_emergency_exit
         or (
             sell_setup_active
+            and (not chop_zone or macd_bear_cross or distribution_flow or stop_exit_confirmed or sell_trigger_price)
             and (
                 stop_exit_confirmed
                 or sell_trigger_price
+                or macd_bear_cross
                 or (close_down_day and sell_score >= max(preset.watch_threshold + 6, buy_score + 8) and bear_regime)
             )
         )
@@ -1527,6 +1753,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         sell_setup_active
         and not sell_trigger
         and not stop_exit_confirmed
+        and (not chop_zone or macd_bear_cross or distribution_flow)
         and (
             bull_regime
             or (rs_percentile is not None and rs_percentile >= 50.0)
@@ -1685,18 +1912,58 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         volume_ratio = _coerce_float(row.get("VolumeRatio20"))
         mfi_change = _coerce_float(row.get("MFIChange5"))
         rs_percentile = _coerce_float(row.get("RSPercentile"))
+        cmf20 = _coerce_float(row.get("CMF20"))
+        obv_slope10 = _coerce_float(row.get("OBVSlope10"))
+        macd_bull_cross = _coerce_bool(row.get("MACDBullCross", False))
+        macd_bear_cross = _coerce_bool(row.get("MACDBearCross", False))
+        bb_width_pct = _coerce_float(row.get("BBWidthPct"))
+        volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp", False))
+        volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown", False))
+        volume_dry_up = _coerce_bool(row.get("VolumeDryUp", False))
         tips_risk_off = _coerce_bool(row.get("TIPSRiskOff", False))
         buy_peak_score = _coerce_float(row.get("BuySetupPeakScore")) or 0.0
         sell_peak_score = _coerce_float(row.get("SellSetupPeakScore")) or 0.0
+        dryup_reversal = bool(
+            volume_dry_up
+            and cycle_score is not None
+            and cycle_score <= 25
+            and rsi is not None
+            and rsi <= 44
+        )
+        accumulation_flow = bool(
+            volume_climax_up
+            or (
+                cmf20 is not None
+                and cmf20 >= 0.03
+                and obv_slope10 is not None
+                and obv_slope10 > 0
+            )
+        )
+        distribution_flow = bool(
+            volume_climax_down
+            or (
+                cmf20 is not None
+                and cmf20 <= -0.03
+                and obv_slope10 is not None
+                and obv_slope10 < 0
+            )
+        )
+        flow_conflict = distribution_flow and not accumulation_flow
+        chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
         buy_flow_support = bool(
             (volume_ratio is not None and volume_ratio >= 1.02)
             or (mfi_change is not None and mfi_change >= 2.0)
             or (rs_percentile is not None and rs_percentile >= (42.0 if reference_asset else 45.0))
+            or accumulation_flow
+            or dryup_reversal
         )
+        if flow_conflict and not panic_low and not macd_bull_cross:
+            buy_flow_support = False
         sell_flow_support = bool(
             (volume_ratio is not None and volume_ratio >= 1.02)
             or (mfi_change is not None and mfi_change <= -2.0)
             or (rs_percentile is not None and rs_percentile <= 40.0)
+            or distribution_flow
         )
         reversal_zone = bool(
             panic_low
@@ -1705,11 +1972,13 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         )
         reversal_confirmation = bool(
             _coerce_bool(row.get("BuyTriggerPrice", False))
+            or macd_bull_cross
             or (close_up_day and buy_flow_support and reversal_zone)
             or (reference_asset and close_up_day and reversal_zone and buy_peak_score >= preset.watch_threshold - 6)
         )
         breakdown_confirmation = bool(
             _coerce_bool(row.get("SellTriggerPrice", False))
+            or macd_bear_cross
             or (close_down_day and sell_flow_support)
         )
         hold_lock_active = in_virtual_position and (index - entry_index) < min_hold_bars
@@ -1732,11 +2001,13 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
                 and sell_score <= max(buy_peak_score + 8, preset.strong_threshold + 2)
                 and not (bear_regime and breakdown_confirmation and not panic_low)
                 and not stop_exit_confirmed
+                and (not chop_zone or macd_bull_cross or buy_flow_support or panic_low)
+                and (not flow_conflict or panic_low or macd_bull_cross)
             ):
                 buy_trigger = True
         if not sell_trigger and sell_window and breakdown_confirmation and not panic_low:
             if sell_peak_score >= preset.watch_threshold + (6 if reference_asset else 4):
-                if sell_flow_support and (bear_regime or stop_exit_confirmed or _coerce_bool(row.get("SellTriggerPrice", False))):
+                if sell_flow_support and (bear_regime or stop_exit_confirmed or _coerce_bool(row.get("SellTriggerPrice", False)) or macd_bear_cross):
                     sell_trigger = True
         if reference_asset and panic_low and buy_window and reversal_confirmation and buy_peak_score >= preset.watch_threshold - 8:
             buy_trigger = True
