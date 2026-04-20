@@ -138,6 +138,27 @@ SELL_COMPONENT_WEIGHTS: dict[str, float] = {
     "confluence": 1.00,
 }
 
+BUY_CUTOFFS: dict[str, float] = {
+    "rsi_reset": 40.0,
+    "rsi_extreme": 32.0,
+    "mfi_reset": 35.0,
+    "mfi_extreme": 18.0,
+    "fear_reset": 40.0,
+    "fear_extreme": 25.0,
+    "bb_low": 0.22,
+}
+
+SELL_CUTOFFS: dict[str, float] = {
+    "rsi_hot": 66.0,
+    "rsi_extreme": 74.0,
+    "mfi_hot": 68.0,
+    "mfi_extreme": 82.0,
+    "greed_hot": 60.0,
+    "greed_extreme": 70.0,
+    "bb_high": 0.78,
+    "bb_extreme": 0.90,
+}
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -1117,6 +1138,16 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
     ema20 = _coerce_float(row.get("EMA20"))
+    buy_rsi_reset = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
+    buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
+    buy_mfi_reset = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
+    buy_mfi_extreme = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_extreme"])
+    buy_fear_reset = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_reset"])
+    buy_fear_extreme = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_extreme"])
+    buy_bb_low = bool(bb_pos is not None and bb_pos <= BUY_CUTOFFS["bb_low"])
+    buy_bb_extreme = bool(bb_pos is not None and bb_pos <= 0.10)
+    buy_cutoff_hits = int(sum([buy_rsi_reset, buy_mfi_reset, buy_fear_reset, buy_bb_low]))
+    buy_extreme_hits = int(sum([buy_rsi_extreme, buy_mfi_extreme, buy_fear_extreme, buy_bb_extreme]))
 
     deep_reversal = cycle_score is not None and cycle_score <= 15 and buy_countdown == 13
     oversold_cluster = False
@@ -1185,39 +1216,32 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif atr_stretch <= -0.6:
             reversion_score += 3
 
-    if rsi is not None:
-        if rsi <= 32:
-            reversion_score += 10
-            oversold_cluster = True
-            reasons.append("RSI washed out")
-        elif rsi <= 40:
-            reversion_score += 6
-            oversold_cluster = True
-            reasons.append("RSI reset")
-        elif rsi <= 46:
-            reversion_score += 3
+    if buy_rsi_extreme:
+        reversion_score += 10
+        oversold_cluster = True
+        reasons.append("RSI washed out")
+    elif buy_rsi_reset:
+        reversion_score += 7
+        oversold_cluster = True
+        reasons.append("RSI reset")
 
-    if mfi is not None:
-        if mfi <= 18:
-            reversion_score += 10
-            oversold_cluster = True
-            reasons.append("MFI capitulation")
-        elif mfi <= 35:
-            reversion_score += 6
-            oversold_cluster = True
-            reasons.append("MFI oversold")
-        elif mfi <= 45:
-            reversion_score += 3
+    if buy_mfi_extreme:
+        reversion_score += 10
+        oversold_cluster = True
+        reasons.append("MFI capitulation")
+    elif buy_mfi_reset:
+        reversion_score += 7
+        oversold_cluster = True
+        reasons.append("MFI oversold")
 
-    if bb_pos is not None:
-        if bb_pos <= 0.10:
-            reversion_score += 10
-            oversold_cluster = True
-            reasons.append("Bollinger lower-tag")
-        elif bb_pos <= 0.22:
-            reversion_score += 6
-            oversold_cluster = True
-            reasons.append("Bollinger low-zone")
+    if buy_bb_extreme:
+        reversion_score += 10
+        oversold_cluster = True
+        reasons.append("Bollinger lower-tag")
+    elif buy_bb_low:
+        reversion_score += 7
+        oversold_cluster = True
+        reasons.append("Bollinger low-zone")
 
     if reference_asset and cycle_score is not None and rsi is not None:
         if cycle_score <= 20 and rsi <= 45:
@@ -1249,13 +1273,12 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     score += weighted_component(td_score, BUY_COMPONENT_WEIGHTS["td"])
 
     macro_score = 0.0
-    if fear_greed is not None:
-        if fear_greed <= 30:
-            macro_score += 8
-            reasons.append("Macro fear tailwind")
-        elif fear_greed <= 45:
-            macro_score += 4
-            reasons.append("Macro risk reset")
+    if buy_fear_extreme:
+        macro_score += 8
+        reasons.append("Macro fear tailwind")
+    elif buy_fear_reset:
+        macro_score += 4
+        reasons.append("Macro risk reset")
     if tips_risk_off:
         if deep_reversal:
             macro_score -= 2
@@ -1345,7 +1368,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
             oversold_cluster,
             accumulation_flow or volume_support,
             relative_support,
-            bool(fear_greed is not None and fear_greed <= 45),
+            bool(buy_cutoff_hits >= 2 or buy_fear_reset),
             bull_regime,
             macd_bull_cross,
         ]
@@ -1354,6 +1377,12 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         confluence_bonus = min(20.0, 6.0 + ((confluence_count - 3) * 4.0))
         score += weighted_component(confluence_bonus, BUY_COMPONENT_WEIGHTS["confluence"])
         reasons.append(f"{confluence_count}x buy confluence")
+    if buy_extreme_hits >= 2:
+        score += weighted_component(8.0, BUY_COMPONENT_WEIGHTS["confluence"])
+        reasons.append("Extreme oversold cutoffs")
+    elif buy_cutoff_hits >= 3:
+        score += weighted_component(5.0, BUY_COMPONENT_WEIGHTS["confluence"])
+        reasons.append("Multi-cutoff washout")
 
     if _coerce_bool(row.get("BuyTriggerPrice")):
         score += weighted_component(6.0, BUY_COMPONENT_WEIGHTS["confirmation"])
@@ -1399,6 +1428,16 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     stop_touched = _coerce_bool(row.get("StopTouched"))
     stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
     sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
+    sell_rsi_hot = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_hot"])
+    sell_rsi_extreme = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_extreme"])
+    sell_mfi_hot = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_hot"])
+    sell_mfi_extreme = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_extreme"])
+    sell_greed_hot = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_hot"])
+    sell_greed_extreme = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_extreme"])
+    sell_bb_hot = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_high"])
+    sell_bb_extreme = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_extreme"])
+    sell_cutoff_hits = int(sum([sell_rsi_hot, sell_mfi_hot, sell_greed_hot, sell_bb_hot]))
+    sell_extreme_hits = int(sum([sell_rsi_extreme, sell_mfi_extreme, sell_greed_extreme, sell_bb_extreme]))
     panic_low = bool(
         cycle_score is not None
         and rsi is not None
@@ -1462,35 +1501,32 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif atr_stretch >= 0.7:
             heat_score += 4
 
-    if rsi is not None:
-        if rsi >= 74:
-            heat_score += 10
-            heat_signal = True
-            reasons.append("RSI overheated")
-        elif rsi >= 66:
-            heat_score += 6
-            heat_signal = True
-            reasons.append("RSI hot")
+    if sell_rsi_extreme:
+        heat_score += 10
+        heat_signal = True
+        reasons.append("RSI overheated")
+    elif sell_rsi_hot:
+        heat_score += 6
+        heat_signal = True
+        reasons.append("RSI hot")
 
-    if mfi is not None:
-        if mfi >= 82:
-            heat_score += 8
-            heat_signal = True
-            reasons.append("MFI euphoric")
-        elif mfi >= 68:
-            heat_score += 4
-            heat_signal = True
-            reasons.append("MFI rich")
+    if sell_mfi_extreme:
+        heat_score += 8
+        heat_signal = True
+        reasons.append("MFI euphoric")
+    elif sell_mfi_hot:
+        heat_score += 4
+        heat_signal = True
+        reasons.append("MFI rich")
 
-    if bb_pos is not None:
-        if bb_pos >= 0.90:
-            heat_score += 8
-            heat_signal = True
-            reasons.append("Bollinger upper-tag")
-        elif bb_pos >= 0.78:
-            heat_score += 4
-            heat_signal = True
-            reasons.append("Bollinger hot-zone")
+    if sell_bb_extreme:
+        heat_score += 8
+        heat_signal = True
+        reasons.append("Bollinger upper-tag")
+    elif sell_bb_hot:
+        heat_score += 4
+        heat_signal = True
+        reasons.append("Bollinger hot-zone")
 
     heat_score = min(18.0, heat_score)
     score += weighted_component(heat_score, SELL_COMPONENT_WEIGHTS["heat"])
@@ -1513,13 +1549,12 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     if blowoff_risk:
         distribution_score += 6
         reasons.append("Blowoff volume")
-    if fear_greed is not None:
-        if fear_greed >= 70:
-            distribution_score += 8
-            reasons.append("Macro greed risk")
-        elif fear_greed >= 60:
-            distribution_score += 4
-            reasons.append("Macro greed warning")
+    if sell_greed_extreme:
+        distribution_score += 8
+        reasons.append("Macro greed risk")
+    elif sell_greed_hot:
+        distribution_score += 4
+        reasons.append("Macro greed warning")
     if tips_risk_off:
         if tips_momentum is not None and tips_momentum <= -0.03:
             distribution_score += 8
@@ -1580,16 +1615,22 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             sell_trigger_price,
             stop_close_breach,
             bear_regime,
-            macd_bear_cross,
+            macd_bear_cross or sell_cutoff_hits >= 2,
         ]
     ))
     if confluence_count >= 3:
         confluence_bonus = min(16.0, 5.0 + ((confluence_count - 3) * 3.0))
         score += weighted_component(confluence_bonus, SELL_COMPONENT_WEIGHTS["confluence"])
         reasons.append(f"{confluence_count}x sell confluence")
+    if sell_extreme_hits >= 2:
+        score += weighted_component(6.0, SELL_COMPONENT_WEIGHTS["confluence"])
+        reasons.append("Extreme hot cutoffs")
+    elif sell_cutoff_hits >= 3:
+        score += weighted_component(4.0, SELL_COMPONENT_WEIGHTS["confluence"])
+        reasons.append("Multi-cutoff heat")
 
     if bull_regime and not stop_close_breach and not sell_trigger_price:
-        score = min(score, 62.0)
+        score = min(score, 56.0 if sell_cutoff_hits < 2 else 62.0)
         if rs_percentile is not None and rs_percentile >= 55:
             score -= 6
         reasons.append("Bull trend trim bias")
@@ -1613,6 +1654,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     open_value = _coerce_float(row.get("Open"))
     cycle_score = _coerce_float(row.get("CycleScore"))
     rsi = _coerce_float(row.get("RSI"))
+    mfi = _coerce_float(row.get("MFI"))
     buy_countdown = int(row.get("BuyCountdown", 0) or 0)
     fear_greed = _coerce_float(row.get("FearGreed"))
     tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
@@ -1624,6 +1666,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     macd_delta = _coerce_float(row.get("MACDHistDelta"))
     macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
     macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
+    bb_pos = _coerce_float(row.get("BBPos20"))
     bb_width_pct = _coerce_float(row.get("BBWidthPct"))
     volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
     volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
@@ -1636,6 +1679,26 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
     close_up_day = _coerce_bool(row.get("CloseUpDay"))
     close_down_day = _coerce_bool(row.get("CloseDownDay"))
+    buy_rsi_cutoff = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
+    buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
+    buy_mfi_cutoff = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
+    buy_mfi_extreme = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_extreme"])
+    buy_fear_cutoff = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_reset"])
+    buy_fear_extreme = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_extreme"])
+    buy_bb_cutoff = bool(bb_pos is not None and bb_pos <= BUY_CUTOFFS["bb_low"])
+    buy_bb_extreme = bool(bb_pos is not None and bb_pos <= 0.10)
+    buy_cutoff_hits = int(sum([buy_rsi_cutoff, buy_mfi_cutoff, buy_fear_cutoff, buy_bb_cutoff]))
+    buy_extreme_hits = int(sum([buy_rsi_extreme, buy_mfi_extreme, buy_fear_extreme, buy_bb_extreme]))
+    sell_rsi_cutoff = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_hot"])
+    sell_rsi_extreme = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_extreme"])
+    sell_mfi_cutoff = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_hot"])
+    sell_mfi_extreme = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_extreme"])
+    sell_greed_cutoff = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_hot"])
+    sell_greed_extreme = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_extreme"])
+    sell_bb_cutoff = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_high"])
+    sell_bb_extreme = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_extreme"])
+    sell_cutoff_hits = int(sum([sell_rsi_cutoff, sell_mfi_cutoff, sell_greed_cutoff, sell_bb_cutoff]))
+    sell_extreme_hits = int(sum([sell_rsi_extreme, sell_mfi_extreme, sell_greed_extreme, sell_bb_extreme]))
 
     deep_reversal = bool(cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
     panic_low = bool(
@@ -1682,12 +1745,66 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     bullish_close = bool(close_value is not None and open_value is not None and close_value >= open_value)
     tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
     chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
+    reference_washout = bool(
+        reference_asset
+        and cycle_score is not None
+        and cycle_score <= 30
+        and buy_cutoff_hits >= 1
+    )
+    strong_trend_dip = bool(
+        bull_regime
+        and cycle_score is not None
+        and cycle_score <= 38
+        and (buy_cutoff_hits >= 1 or cycle_score <= 25)
+        and volume_support
+        and (macd_bull_cross or buy_trigger_price)
+        and not flow_conflict
+    )
+    buy_cutoff_ready = bool(
+        deep_reversal
+        or reference_washout
+        or buy_extreme_hits >= 1
+        or (cycle_score is not None and cycle_score <= 35 and buy_cutoff_hits >= 1)
+        or (
+            cycle_score is not None
+            and cycle_score <= 45
+            and buy_cutoff_hits >= 2
+            and (volume_support or macd_bull_cross or bull_regime)
+        )
+        or strong_trend_dip
+    )
+    sell_capitulation_block = bool(
+        deep_reversal
+        or buy_extreme_hits >= 2
+        or (cycle_score is not None and cycle_score <= 30 and buy_cutoff_hits >= 2)
+    )
+    sell_cutoff_ready = bool(
+        sell_trigger_price
+        or sell_extreme_hits >= 2
+        or (stop_close_breach and not sell_capitulation_block)
+        or (
+            bull_regime
+            and cycle_score is not None
+            and cycle_score >= 72
+            and sell_cutoff_hits >= 2
+            and (distribution_flow or macd_bear_cross or tips_risk_off or stop_touched)
+        )
+        or (
+            not bull_regime
+            and cycle_score is not None
+            and cycle_score >= 68
+            and sell_cutoff_hits >= 1
+            and (distribution_flow or macd_bear_cross or bear_regime or tips_risk_off or stop_touched)
+        )
+    )
 
     buy_setup_threshold = preset.watch_threshold
     if bull_regime and relative_support:
         buy_setup_threshold -= 3
     if reference_asset:
         buy_setup_threshold -= 5
+    if buy_cutoff_hits >= 2 or deep_reversal:
+        buy_setup_threshold -= 2
     if tips_risk_off and not deep_reversal:
         buy_setup_threshold += 2
     if chop_zone and not (macd_bull_cross or accumulation_flow or deep_reversal):
@@ -1695,13 +1812,26 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     if flow_conflict and not deep_reversal:
         buy_setup_threshold += 4
     buy_setup_active = (
-        (buy_score >= buy_setup_threshold and (buy_score >= sell_score - 10 or deep_reversal))
-        or (reference_asset and cycle_score is not None and rsi is not None and cycle_score <= 20 and rsi <= 45)
+        (
+            buy_score >= buy_setup_threshold
+            and buy_cutoff_ready
+            and (buy_score >= sell_score - 8 or deep_reversal)
+        )
+        or reference_washout
+        or strong_trend_dip
     )
     sell_setup_threshold = preset.watch_threshold + (4 if reference_asset else 0)
+    if sell_cutoff_hits == 0 and not stop_close_breach and not sell_trigger_price:
+        sell_setup_threshold += 4
     if chop_zone and not (macd_bear_cross or distribution_flow or stop_close_breach):
         sell_setup_threshold += 3
-    sell_setup_active = sell_score >= sell_setup_threshold and sell_score >= buy_score - 4 and not panic_low
+    sell_setup_active = bool(
+        (not sell_capitulation_block)
+        and (
+            stop_close_breach
+            or (sell_score >= sell_setup_threshold and sell_cutoff_ready and sell_score >= buy_score - 2 and not panic_low)
+        )
+    )
     stop_exit_confirmed, stop_emergency_exit, stop_gap_atr = evaluate_stop_exit(
         close_value,
         stop_price,
@@ -1716,6 +1846,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     buy_trigger = bool(
         buy_setup_active
         and not stop_exit_confirmed
+        and (buy_cutoff_ready or strong_trend_dip)
         and (not chop_zone or macd_bull_cross or accumulation_flow or deep_reversal or buy_trigger_price)
         and (not flow_conflict or deep_reversal or macd_bull_cross)
         and (
@@ -1740,6 +1871,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         stop_emergency_exit
         or (
             sell_setup_active
+            and sell_cutoff_ready
             and (not chop_zone or macd_bear_cross or distribution_flow or stop_exit_confirmed or sell_trigger_price)
             and (
                 stop_exit_confirmed
@@ -1751,13 +1883,15 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     )
     trim_ready = bool(
         sell_setup_active
+        and sell_cutoff_ready
+        and not sell_capitulation_block
         and not sell_trigger
         and not stop_exit_confirmed
         and (not chop_zone or macd_bear_cross or distribution_flow)
         and (
             bull_regime
             or (rs_percentile is not None and rs_percentile >= 50.0)
-            or (fear_greed is not None and fear_greed >= 55.0)
+            or sell_greed_cutoff
         )
     )
 
@@ -1900,6 +2034,8 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         atr_value = _coerce_float(row.get("ATR"))
         cycle_score = _coerce_float(row.get("CycleScore"))
         rsi = _coerce_float(row.get("RSI"))
+        mfi = _coerce_float(row.get("MFI"))
+        fear_greed = _coerce_float(row.get("FearGreed"))
         atr_stretch = _coerce_float(row.get("ATRStretch"))
         panic_low = bool(
             cycle_score is not None
@@ -1916,6 +2052,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         obv_slope10 = _coerce_float(row.get("OBVSlope10"))
         macd_bull_cross = _coerce_bool(row.get("MACDBullCross", False))
         macd_bear_cross = _coerce_bool(row.get("MACDBearCross", False))
+        bb_pos = _coerce_float(row.get("BBPos20"))
         bb_width_pct = _coerce_float(row.get("BBWidthPct"))
         volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp", False))
         volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown", False))
@@ -1923,6 +2060,16 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         tips_risk_off = _coerce_bool(row.get("TIPSRiskOff", False))
         buy_peak_score = _coerce_float(row.get("BuySetupPeakScore")) or 0.0
         sell_peak_score = _coerce_float(row.get("SellSetupPeakScore")) or 0.0
+        buy_rsi_cutoff = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
+        buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
+        buy_mfi_cutoff = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
+        buy_mfi_extreme = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_extreme"])
+        buy_fear_cutoff = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_reset"])
+        buy_fear_extreme = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_extreme"])
+        buy_bb_cutoff = bool(bb_pos is not None and bb_pos <= BUY_CUTOFFS["bb_low"])
+        buy_bb_extreme = bool(bb_pos is not None and bb_pos <= 0.10)
+        buy_cutoff_hits = int(sum([buy_rsi_cutoff, buy_mfi_cutoff, buy_fear_cutoff, buy_bb_cutoff]))
+        buy_extreme_hits = int(sum([buy_rsi_extreme, buy_mfi_extreme, buy_fear_extreme, buy_bb_extreme]))
         dryup_reversal = bool(
             volume_dry_up
             and cycle_score is not None
@@ -1994,6 +2141,16 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
             hold_lock_active=hold_lock_active,
             macro_risk_off=tips_risk_off,
         )
+        sell_capitulation_block = bool(
+            panic_low
+            or buy_extreme_hits >= 2
+            or (cycle_score is not None and cycle_score <= 30 and buy_cutoff_hits >= 2)
+        )
+        if sell_capitulation_block and not stop_emergency_exit:
+            sell_window = False
+            if not _coerce_bool(row.get("SellTriggerPrice", False)):
+                sell_trigger = False
+                breakdown_confirmation = False
 
         if not buy_trigger and buy_window and reversal_confirmation and reversal_zone:
             if (
@@ -2005,7 +2162,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
                 and (not flow_conflict or panic_low or macd_bull_cross)
             ):
                 buy_trigger = True
-        if not sell_trigger and sell_window and breakdown_confirmation and not panic_low:
+        if not sell_trigger and sell_window and breakdown_confirmation and not panic_low and not sell_capitulation_block:
             if sell_peak_score >= preset.watch_threshold + (6 if reference_asset else 4):
                 if sell_flow_support and (bear_regime or stop_exit_confirmed or _coerce_bool(row.get("SellTriggerPrice", False)) or macd_bear_cross):
                     sell_trigger = True
@@ -2047,9 +2204,9 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
             state = "Buy"
         elif buy_window and buy_peak_score >= preset.watch_threshold - (8 if reference_asset else 6) and sell_score <= buy_peak_score + 12:
             state = "Weak Buy"
-        elif sell_window and not panic_low and sell_peak_score >= preset.watch_threshold + (8 if reference_asset else 2) and sell_score > buy_score + (6 if reference_asset else 4):
+        elif sell_window and not panic_low and not sell_capitulation_block and sell_peak_score >= preset.watch_threshold + (8 if reference_asset else 2) and sell_score > buy_score + (6 if reference_asset else 4):
             state = "Sell"
-        elif sell_window and not panic_low and sell_peak_score >= preset.watch_threshold - (2 if reference_asset else 3) and sell_score > buy_score + (4 if reference_asset else 2):
+        elif sell_window and not panic_low and not sell_capitulation_block and sell_peak_score >= preset.watch_threshold - (2 if reference_asset else 3) and sell_score > buy_score + (4 if reference_asset else 2):
             state = "Weak Sell"
         else:
             state = "Hold / Neutral"
