@@ -376,6 +376,7 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
         neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
         return {
             "score_series": neutral_series,
+            "benchmark_close": pd.Series(dtype=float, name="SPY"),
             "plot_df": pd.DataFrame({"Score": neutral_series}),
             "latest_score": 50.0,
             "latest_label": "Neutral",
@@ -389,6 +390,7 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
         neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
         return {
             "score_series": neutral_series,
+            "benchmark_close": pd.Series(dtype=float, name="SPY"),
             "plot_df": pd.DataFrame({"Score": neutral_series}),
             "latest_score": 50.0,
             "latest_label": "Neutral",
@@ -401,6 +403,7 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
     latest_label = classify_fear_greed(latest_score)
     return {
         "score_series": score_series,
+        "benchmark_close": close_panel["SPY"].copy() if "SPY" in close_panel.columns else pd.Series(dtype=float, name="SPY"),
         "plot_df": plot_df,
         "latest_score": latest_score,
         "latest_label": latest_label,
@@ -455,6 +458,34 @@ def calc_atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
         np.maximum((frame["High"] - prev_close).abs(), (frame["Low"] - prev_close).abs()),
     )
     return pd.Series(true_range, index=frame.index).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_mfi(frame: pd.DataFrame, period: int = 14) -> pd.Series:
+    typical_price = (frame["High"] + frame["Low"] + frame["Close"]) / 3.0
+    raw_money_flow = typical_price * pd.to_numeric(frame["Volume"], errors="coerce").fillna(0.0)
+    direction = typical_price.diff()
+    positive_flow = raw_money_flow.where(direction > 0.0, 0.0)
+    negative_flow = raw_money_flow.where(direction < 0.0, 0.0).abs()
+    positive_sum = positive_flow.rolling(period, min_periods=period).sum()
+    negative_sum = negative_flow.rolling(period, min_periods=period).sum()
+    flow_ratio = positive_sum / negative_sum.replace(0.0, np.nan)
+    mfi = 100.0 - (100.0 / (1.0 + flow_ratio))
+    mfi = mfi.where(negative_sum.gt(0.0), 100.0)
+    mfi = mfi.where(positive_sum.gt(0.0), 0.0)
+    return mfi.fillna(50.0)
+
+
+def calc_adx(frame: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
+    up_move = frame["High"].diff()
+    down_move = -frame["Low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0), index=frame.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0), index=frame.index)
+    atr = calc_atr(frame, period)
+    plus_di = 100.0 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0.0, np.nan)
+    minus_di = 100.0 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    return plus_di, minus_di, adx
 
 
 def compute_td_sequential(frame: pd.DataFrame) -> pd.DataFrame:
@@ -642,7 +673,11 @@ def build_td_label_series(frame: pd.DataFrame) -> pd.Series:
     return labels
 
 
-def compute_indicators(price_df: pd.DataFrame, macro_score_series: pd.Series | None) -> pd.DataFrame:
+def compute_indicators(
+    price_df: pd.DataFrame,
+    macro_score_series: pd.Series | None,
+    benchmark_close_series: pd.Series | None = None,
+) -> pd.DataFrame:
     frame = normalize_ohlcv_frame(price_df)
     if frame.empty:
         return frame
@@ -653,10 +688,24 @@ def compute_indicators(price_df: pd.DataFrame, macro_score_series: pd.Series | N
     work["EMA200"] = work["Close"].ewm(span=200, adjust=False, min_periods=200).mean()
     work["RSI"] = calc_rsi(work["Close"], period=14)
     work["ATR"] = calc_atr(work, period=14)
+    work["MFI"] = calc_mfi(work, period=14)
+    plus_di, minus_di, adx = calc_adx(work, period=14)
+    work["PlusDI"] = plus_di
+    work["MinusDI"] = minus_di
+    work["ADX"] = adx
     work["ChandelierStop"] = work["High"].rolling(22, min_periods=22).max() - (3.0 * work["ATR"])
     work["ATRStretch"] = (work["Close"] - work["EMA20"]) / work["ATR"].replace(0, np.nan)
     work["StopDistance"] = (work["Close"] / work["ChandelierStop"]) - 1.0
     work["EMA50Slope20"] = work["EMA50"] - work["EMA50"].shift(20)
+    work["VolumeSMA20"] = pd.to_numeric(work["Volume"], errors="coerce").rolling(20, min_periods=20).mean()
+    work["VolumeRatio20"] = pd.to_numeric(work["Volume"], errors="coerce") / work["VolumeSMA20"].replace(0.0, np.nan)
+    work["MFIChange5"] = work["MFI"] - work["MFI"].shift(5)
+    work["BuyTriggerPrice"] = work["Close"] > work["High"].shift(1)
+    work["SellTriggerPrice"] = work["Close"] < work["Low"].shift(1)
+    work["CloseUpDay"] = work["Close"] > work["Close"].shift(1)
+    work["CloseDownDay"] = work["Close"] < work["Close"].shift(1)
+    work["StopTouched"] = work["Low"] <= work["ChandelierStop"]
+    work["StopCloseBreach"] = work["Close"] <= work["ChandelierStop"]
 
     td = compute_td_sequential(work)
     work = work.join(td, how="left")
@@ -664,6 +713,17 @@ def compute_indicators(price_df: pd.DataFrame, macro_score_series: pd.Series | N
     work = work.join(stl, how="left")
     work["TrendDelta5"] = work["Trend"] - work["Trend"].shift(5)
     work["TDLabel"] = build_td_label_series(work)
+
+    if benchmark_close_series is None or benchmark_close_series.empty:
+        work["RelativeStrength"] = np.nan
+        work["RSMomentum63"] = np.nan
+        work["RSPercentile"] = np.nan
+    else:
+        benchmark_close = pd.to_numeric(benchmark_close_series, errors="coerce").reindex(work.index).ffill().bfill()
+        relative_strength = work["Close"] / benchmark_close.replace(0.0, np.nan)
+        work["RelativeStrength"] = relative_strength
+        work["RSMomentum63"] = relative_strength / relative_strength.shift(63) - 1.0
+        work["RSPercentile"] = rolling_percentile(relative_strength, window=252, min_periods=63) * 100.0
 
     if macro_score_series is None or macro_score_series.empty:
         work["FearGreed"] = 50.0
@@ -679,166 +739,354 @@ def _coerce_float(value: Any) -> float | None:
     return float(value)
 
 
+def _coerce_bool(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return False if pd.isna(value) else bool(value)
+
+
+def classify_market_regime(row: Any) -> str:
+    close_value = _coerce_float(row.get("Close"))
+    ema50 = _coerce_float(row.get("EMA50"))
+    ema200 = _coerce_float(row.get("EMA200"))
+    trend_delta = _coerce_float(row.get("TrendDelta5"))
+    adx = _coerce_float(row.get("ADX"))
+    plus_di = _coerce_float(row.get("PlusDI"))
+    minus_di = _coerce_float(row.get("MinusDI"))
+
+    strong_trend = adx is not None and adx >= 23
+    bull_context = all(value is not None for value in [close_value, ema50, ema200, trend_delta]) and bool(
+        close_value >= ema200 and ema50 >= ema200 and trend_delta >= 0
+    )
+    bear_context = all(value is not None for value in [close_value, ema50, ema200, trend_delta]) and bool(
+        close_value < ema200 and ema50 < ema200 and trend_delta < 0
+    )
+    plus_bias = plus_di is not None and minus_di is not None and plus_di >= minus_di
+    minus_bias = plus_di is not None and minus_di is not None and minus_di > plus_di
+
+    if bull_context and strong_trend and plus_bias:
+        return "Bull Trend"
+    if bear_context and strong_trend and minus_bias:
+        return "Bear Trend"
+    if bull_context:
+        return "Bull Pullback"
+    if bear_context:
+        return "Bear Rally"
+    return "Range / Transition"
+
+
+def _is_bull_regime(regime: str) -> bool:
+    return regime in {"Bull Trend", "Bull Pullback"}
+
+
+def _is_bear_regime(regime: str) -> bool:
+    return regime in {"Bear Trend", "Bear Rally"}
+
+
 def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
-    score = 0
+    score = 0.0
     reasons: list[str] = []
+    regime = classify_market_regime(row)
+    bull_regime = _is_bull_regime(regime)
+    bear_regime = _is_bear_regime(regime)
+
     cycle_score = _coerce_float(row.get("CycleScore"))
     buy_setup = int(row.get("BuySetup", 0) or 0)
     buy_countdown = int(row.get("BuyCountdown", 0) or 0)
     atr_stretch = _coerce_float(row.get("ATRStretch"))
     rsi = _coerce_float(row.get("RSI"))
+    mfi = _coerce_float(row.get("MFI"))
+    mfi_change = _coerce_float(row.get("MFIChange5"))
     fear_greed = _coerce_float(row.get("FearGreed"))
+    rs_percentile = _coerce_float(row.get("RSPercentile"))
+    rs_momentum = _coerce_float(row.get("RSMomentum63"))
+    volume_ratio = _coerce_float(row.get("VolumeRatio20"))
     close_value = _coerce_float(row.get("Close"))
+    open_value = _coerce_float(row.get("Open"))
     ema20 = _coerce_float(row.get("EMA20"))
-    ema50 = _coerce_float(row.get("EMA50"))
-    ema200 = _coerce_float(row.get("EMA200"))
-    ema50_slope = _coerce_float(row.get("EMA50Slope20"))
-    trend_delta = _coerce_float(row.get("TrendDelta5"))
 
+    deep_reversal = cycle_score is not None and cycle_score <= 15 and buy_countdown == 13
+    oversold_cluster = False
+    volume_support = bool(
+        (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
+        or (mfi_change is not None and mfi_change >= 5.0)
+    )
+    relative_support = bool(
+        (rs_percentile is not None and rs_percentile >= 50.0)
+        or (rs_momentum is not None and rs_momentum >= -0.01)
+    )
+
+    reversion_score = 0.0
     if cycle_score is not None:
-        if cycle_score <= 20:
-            score += 30
-            reasons.append("STL deep cycle")
+        if cycle_score <= 15:
+            reversion_score += 18
+            reasons.append("STL capitulation low")
+        elif cycle_score <= 25:
+            reversion_score += 14
+            reasons.append("STL cycle low")
         elif cycle_score <= 35:
-            score += 20
+            reversion_score += 9
             reasons.append("STL accumulation zone")
         elif cycle_score <= 45:
-            score += 10
-            reasons.append("STL early pullback")
-
-    if buy_countdown == 13:
-        score += 25
-        reasons.append("TD buy countdown 13")
-    elif buy_setup >= 8:
-        score += 18
-        reasons.append(f"TD buy setup {buy_setup}")
-    elif buy_setup >= 7:
-        score += 10
-        reasons.append(f"TD buy setup {buy_setup}")
+            reversion_score += 5
+            reasons.append("STL early reset")
 
     if atr_stretch is not None:
         if atr_stretch <= -1.8:
-            score += 20
+            reversion_score += 10
+            oversold_cluster = True
             reasons.append("ATR deep pullback")
-        elif atr_stretch <= -1.0:
-            score += 12
+        elif atr_stretch <= -1.1:
+            reversion_score += 7
+            oversold_cluster = True
             reasons.append("ATR pullback")
-        elif atr_stretch <= -0.5:
-            score += 6
-            reasons.append("ATR light pullback")
+        elif atr_stretch <= -0.6:
+            reversion_score += 3
 
     if rsi is not None:
-        if rsi <= 35:
-            score += 10
-            reasons.append("RSI oversold")
-        elif rsi <= 42:
-            score += 6
-            reasons.append("RSI weak")
+        if rsi <= 32:
+            reversion_score += 10
+            oversold_cluster = True
+            reasons.append("RSI washed out")
+        elif rsi <= 40:
+            reversion_score += 6
+            oversold_cluster = True
+            reasons.append("RSI reset")
+        elif rsi <= 46:
+            reversion_score += 3
 
+    if mfi is not None:
+        if mfi <= 18:
+            reversion_score += 10
+            oversold_cluster = True
+            reasons.append("MFI capitulation")
+        elif mfi <= 35:
+            reversion_score += 6
+            oversold_cluster = True
+            reasons.append("MFI oversold")
+        elif mfi <= 45:
+            reversion_score += 3
+
+    reversion_cap = 28 if regime == "Range / Transition" else 24 if bull_regime else 20
+    score += min(reversion_cap, reversion_score)
+
+    td_score = 0.0
+    if buy_countdown == 13:
+        td_score = 24
+        reasons.append("TD buy countdown 13")
+    elif buy_setup >= 9:
+        td_score = 18
+        reasons.append(f"TD buy setup {buy_setup}")
+    elif buy_setup >= 7:
+        td_score = 10
+        reasons.append(f"TD buy setup {buy_setup}")
+    score += td_score
+
+    context_score = 0.0
     if fear_greed is not None:
-        if fear_greed <= 40:
-            score += 15
-            reasons.append("Macro fear supportive")
-        elif fear_greed <= 50:
-            score += 8
-            reasons.append("Macro neutral-to-fear")
+        if fear_greed <= 30:
+            context_score += 8
+            reasons.append("Macro fear tailwind")
+        elif fear_greed <= 45:
+            context_score += 4
+            reasons.append("Macro risk reset")
 
-    trend_supportive = all(
-        value is not None
-        for value in [close_value, ema20, ema50, ema200, trend_delta]
-    ) and bool(close_value >= ema200 and ema50 >= ema200 and trend_delta >= 0)
+    if relative_support:
+        context_score += 8 if rs_percentile is not None and rs_percentile >= 60 else 5
+        reasons.append("Relative strength supportive")
+    elif rs_percentile is not None and rs_percentile < 25:
+        context_score -= 10
+        reasons.append("Relative strength weak")
+    elif rs_percentile is not None and rs_percentile < 40:
+        context_score -= 4
 
-    if trend_supportive and atr_stretch is not None:
-        if atr_stretch <= -0.4:
-            score += 12
-            reasons.append("Trend pullback booster")
-        elif atr_stretch <= 0.0:
-            score += 6
-            reasons.append("Shallow dip in uptrend")
+    if volume_support:
+        context_score += 8
+        reasons.append("Volume-backed reversal")
+    elif mfi is not None and mfi < 25 and mfi_change is not None and mfi_change < 0 and bear_regime:
+        context_score -= 8
+        reasons.append("Falling knife flow")
 
-    if trend_supportive and cycle_score is not None and cycle_score <= 55:
-        score += 8
-        reasons.append("Trend + cycle support")
+    if bull_regime:
+        context_score += 8
+        reasons.append("Bull regime support")
+    elif regime == "Range / Transition":
+        context_score += 3
+    elif not deep_reversal:
+        context_score -= 12
+        reasons.append("Bear regime penalty")
 
-    if trend_supportive and rsi is not None and rsi <= 52:
+    if bull_regime and atr_stretch is not None and atr_stretch <= -0.5 and close_value is not None and ema20 is not None and close_value >= ema20:
+        context_score += 6
+        reasons.append("Trend dip setup")
+
+    score += context_score
+
+    confluence_count = int(sum(
+        [
+            bool(cycle_score is not None and cycle_score <= 35),
+            bool(buy_setup >= 8 or buy_countdown == 13),
+            oversold_cluster,
+            volume_support,
+            relative_support,
+            bool(fear_greed is not None and fear_greed <= 45),
+            bull_regime,
+        ]
+    ))
+    if confluence_count >= 3:
+        confluence_bonus = min(20.0, 6.0 + ((confluence_count - 3) * 4.0))
+        score += confluence_bonus
+        reasons.append(f"{confluence_count}x buy confluence")
+
+    if _coerce_bool(row.get("BuyTriggerPrice")):
         score += 6
-        reasons.append("RSI reset in uptrend")
+        reasons.append("Price confirmation")
 
-    downtrend_cap = False
-    if close_value is not None and ema200 is not None and close_value < ema200:
-        downtrend_cap = True
-    if ema50 is not None and ema200 is not None and ema50 < ema200:
-        downtrend_cap = True
-    if ema50_slope is not None and ema50_slope < 0:
-        downtrend_cap = True
-    if trend_delta is not None and trend_delta < 0:
-        downtrend_cap = True
-
-    exception_enabled = cycle_score is not None and cycle_score <= 15 and buy_countdown == 13
-    if downtrend_cap and not exception_enabled:
-        score = min(score, 55)
-        reasons.append("Downtrend cap active")
-
+    if bear_regime and not deep_reversal:
+        score = min(score, 62.0)
     return max(0, min(100, int(round(score)))), reasons[:5]
 
 
 def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
-    score = 0
+    score = 0.0
     reasons: list[str] = []
+    regime = classify_market_regime(row)
+    bull_regime = _is_bull_regime(regime)
+    bear_regime = _is_bear_regime(regime)
+
     cycle_score = _coerce_float(row.get("CycleScore"))
     sell_setup = int(row.get("SellSetup", 0) or 0)
     sell_countdown = int(row.get("SellCountdown", 0) or 0)
     atr_stretch = _coerce_float(row.get("ATRStretch"))
     rsi = _coerce_float(row.get("RSI"))
+    mfi = _coerce_float(row.get("MFI"))
+    mfi_change = _coerce_float(row.get("MFIChange5"))
     fear_greed = _coerce_float(row.get("FearGreed"))
+    rs_percentile = _coerce_float(row.get("RSPercentile"))
+    rs_momentum = _coerce_float(row.get("RSMomentum63"))
+    volume_ratio = _coerce_float(row.get("VolumeRatio20"))
+    close_value = _coerce_float(row.get("Close"))
+    open_value = _coerce_float(row.get("Open"))
+    stop_touched = _coerce_bool(row.get("StopTouched"))
+    sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
 
+    exhaustion_score = 0.0
     if cycle_score is not None:
-        if cycle_score >= 80:
-            score += 30
+        if cycle_score >= 85:
+            exhaustion_score += 16
             reasons.append("STL overheated")
-        elif cycle_score >= 65:
-            score += 20
+        elif cycle_score >= 72:
+            exhaustion_score += 12
             reasons.append("STL extended")
-        elif cycle_score >= 55:
-            score += 10
+        elif cycle_score >= 60:
+            exhaustion_score += 7
             reasons.append("STL rich")
+    score += exhaustion_score
 
+    td_score = 0.0
     if sell_countdown == 13:
-        score += 25
+        td_score = 18
         reasons.append("TD sell countdown 13")
-    elif sell_setup >= 8:
-        score += 18
+    elif sell_setup >= 9:
+        td_score = 12
         reasons.append(f"TD sell setup {sell_setup}")
     elif sell_setup >= 7:
-        score += 10
+        td_score = 8
         reasons.append(f"TD sell setup {sell_setup}")
+    score += td_score
 
+    heat_score = 0.0
+    heat_signal = False
     if atr_stretch is not None:
         if atr_stretch >= 1.8:
-            score += 20
+            heat_score += 12
+            heat_signal = True
             reasons.append("ATR overextension")
-        elif atr_stretch >= 1.0:
-            score += 12
+        elif atr_stretch >= 1.1:
+            heat_score += 8
+            heat_signal = True
             reasons.append("ATR stretched")
-        elif atr_stretch >= 0.5:
-            score += 4
-            reasons.append("ATR mildly extended")
+        elif atr_stretch >= 0.7:
+            heat_score += 4
 
     if rsi is not None:
-        if rsi >= 72:
-            score += 10
-            reasons.append("RSI overbought")
-        elif rsi >= 64:
-            score += 6
+        if rsi >= 74:
+            heat_score += 10
+            heat_signal = True
+            reasons.append("RSI overheated")
+        elif rsi >= 66:
+            heat_score += 6
+            heat_signal = True
             reasons.append("RSI hot")
 
+    if mfi is not None:
+        if mfi >= 82:
+            heat_score += 8
+            heat_signal = True
+            reasons.append("MFI euphoric")
+        elif mfi >= 68:
+            heat_score += 4
+            heat_signal = True
+            reasons.append("MFI rich")
+
+    score += min(18.0, heat_score)
+
+    distribution_score = 0.0
+    distribution_flow = bool(
+        (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value < open_value)
+        or (mfi_change is not None and mfi_change <= -5.0 and mfi is not None and mfi >= 60.0)
+    )
+    if distribution_flow:
+        distribution_score += 8
+        reasons.append("Distribution flow")
     if fear_greed is not None:
-        if fear_greed >= 60:
-            score += 10
+        if fear_greed >= 70:
+            distribution_score += 8
+            reasons.append("Macro greed risk")
+        elif fear_greed >= 60:
+            distribution_score += 4
             reasons.append("Macro greed warning")
-        elif fear_greed >= 50:
-            score += 4
-            reasons.append("Macro risk appetite")
+    if rs_percentile is not None and rs_percentile <= 25:
+        distribution_score += 8
+        reasons.append("Relative strength breakdown")
+    elif rs_percentile is not None and rs_percentile <= 40:
+        distribution_score += 4
+    if rs_momentum is not None and rs_momentum <= -0.03:
+        distribution_score += 6
+    if sell_trigger_price:
+        distribution_score += 12
+        reasons.append("Price breakdown")
+    if stop_touched:
+        distribution_score += 18
+        reasons.append("Trailing stop touched")
+    if bear_regime:
+        distribution_score += 12
+        reasons.append("Bear regime pressure")
+    score += distribution_score
+
+    confluence_count = int(sum(
+        [
+            bool(cycle_score is not None and cycle_score >= 72),
+            bool(sell_setup >= 8 or sell_countdown == 13),
+            heat_signal,
+            distribution_flow,
+            sell_trigger_price,
+            stop_touched,
+            bear_regime,
+        ]
+    ))
+    if confluence_count >= 3:
+        confluence_bonus = min(16.0, 5.0 + ((confluence_count - 3) * 3.0))
+        score += confluence_bonus
+        reasons.append(f"{confluence_count}x sell confluence")
+
+    if bull_regime and not stop_touched and not sell_trigger_price:
+        score = min(score, 62.0)
+        if rs_percentile is not None and rs_percentile >= 55:
+            score -= 6
+        reasons.append("Bull trend trim bias")
 
     return max(0, min(100, int(round(score)))), reasons[:5]
 
@@ -846,45 +1094,83 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
 def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     buy_score, buy_reasons = score_buy_signal(row)
     sell_score, sell_reasons = score_sell_signal(row)
+    regime = classify_market_regime(row)
+    bull_regime = _is_bull_regime(regime)
+    bear_regime = _is_bear_regime(regime)
+
     close_value = _coerce_float(row.get("Close"))
-    ema50 = _coerce_float(row.get("EMA50"))
-    ema200 = _coerce_float(row.get("EMA200"))
-    trend_delta = _coerce_float(row.get("TrendDelta5"))
+    open_value = _coerce_float(row.get("Open"))
     cycle_score = _coerce_float(row.get("CycleScore"))
-    atr_stretch = _coerce_float(row.get("ATRStretch"))
-    rsi = _coerce_float(row.get("RSI"))
     buy_countdown = int(row.get("BuyCountdown", 0) or 0)
-    stop_breached = bool(pd.notna(row.get("ChandelierStop")) and row["Close"] <= row["ChandelierStop"])
-    trend_supportive = all(value is not None for value in [close_value, ema50, ema200, trend_delta]) and bool(close_value >= ema200 and ema50 >= ema200 and trend_delta >= 0)
-    trend_weak = (
-        (close_value is not None and ema50 is not None and close_value < ema50)
-        or (ema50 is not None and ema200 is not None and ema50 < ema200)
-        or (trend_delta is not None and trend_delta < 0)
+    fear_greed = _coerce_float(row.get("FearGreed"))
+    rs_percentile = _coerce_float(row.get("RSPercentile"))
+    volume_ratio = _coerce_float(row.get("VolumeRatio20"))
+    mfi_change = _coerce_float(row.get("MFIChange5"))
+    stop_touched = _coerce_bool(row.get("StopTouched"))
+    stop_close_breach = _coerce_bool(row.get("StopCloseBreach")) or stop_touched
+    buy_trigger_price = _coerce_bool(row.get("BuyTriggerPrice"))
+    sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
+    close_up_day = _coerce_bool(row.get("CloseUpDay"))
+    close_down_day = _coerce_bool(row.get("CloseDownDay"))
+
+    deep_reversal = bool(cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
+    volume_support = bool(
+        (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
+        or (mfi_change is not None and mfi_change >= 5.0)
     )
-    deep_reversal = bool(
-        (cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
-        or (
-            atr_stretch is not None
-            and rsi is not None
-            and atr_stretch <= -1.5
-            and rsi <= 32
-            and sell_score <= max(20, preset.watch_threshold - 10)
+    relative_support = bool(rs_percentile is not None and rs_percentile >= 50.0)
+    bullish_close = bool(close_value is not None and open_value is not None and close_value >= open_value)
+
+    buy_setup_threshold = preset.watch_threshold - 3 if bull_regime and relative_support else preset.watch_threshold
+    buy_setup_active = buy_score >= buy_setup_threshold and (buy_score >= sell_score - 10 or deep_reversal)
+    buy_trigger = bool(
+        buy_setup_active
+        and not stop_close_breach
+        and (
+            buy_trigger_price
+            or (deep_reversal and bullish_close and (volume_support or relative_support))
+            or (
+                close_up_day
+                and buy_score >= max(preset.watch_threshold + 4, sell_score + 6)
+                and (volume_support or deep_reversal or bull_regime)
+            )
+            or (bull_regime and buy_score >= max(preset.watch_threshold, preset.strong_threshold - 8) and bullish_close and volume_support)
         )
     )
 
-    if buy_score >= preset.strong_threshold and ((buy_score - sell_score) >= 5 or (deep_reversal and buy_score >= sell_score)):
-        state = "Strong Buy"
-        key_reasons = buy_reasons
-    elif buy_score >= preset.watch_threshold and ((trend_supportive and buy_score >= sell_score) or deep_reversal):
-        state = "Buy Watch"
-        key_reasons = buy_reasons
-    elif sell_score >= preset.strong_threshold and (sell_score - buy_score) >= 8 and trend_weak:
+    sell_setup_active = sell_score >= preset.watch_threshold and sell_score >= buy_score - 4
+    sell_trigger = bool(
+        sell_setup_active
+        and (
+            stop_touched
+            or sell_trigger_price
+            or (close_down_day and sell_score >= max(preset.watch_threshold + 6, buy_score + 8) and bear_regime)
+            or (bear_regime and stop_close_breach)
+        )
+    )
+    trim_ready = bool(
+        sell_setup_active
+        and not sell_trigger
+        and (
+            bull_regime
+            or (rs_percentile is not None and rs_percentile >= 50.0)
+            or (fear_greed is not None and fear_greed >= 55.0)
+        )
+    )
+
+    buy_strong_threshold = preset.strong_threshold - 5 if bull_regime and relative_support else preset.strong_threshold
+    sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_touched else preset.strong_threshold
+
+    if sell_trigger and (stop_touched or sell_score >= max(sell_strong_threshold, buy_score + 4)):
         state = "Strong Sell"
         key_reasons = sell_reasons
-    elif stop_breached and trend_weak and sell_score >= max(45, preset.watch_threshold - 5):
-        state = "Strong Sell"
-        key_reasons = sell_reasons if sell_reasons else ["Protective stop breach"]
-    elif sell_score >= preset.watch_threshold and (sell_score - buy_score) >= 5:
+    elif buy_trigger and buy_score >= max(preset.watch_threshold, buy_strong_threshold) and buy_score >= sell_score - 5:
+        state = "Strong Buy"
+        key_reasons = buy_reasons
+    elif buy_setup_active:
+        state = "Buy Watch"
+        key_reasons = buy_reasons
+    elif trim_ready or (sell_setup_active and sell_score > buy_score + 2):
         state = "Trim"
         key_reasons = sell_reasons
     else:
@@ -892,21 +1178,55 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         key_reasons = buy_reasons[:2] + sell_reasons[:2]
 
     td_label = str(row.get("TDLabel", "Unavailable"))
-    cycle_score = _coerce_float(row.get("CycleScore"))
-    fear_greed = _coerce_float(row.get("FearGreed"))
     cycle_text = f"Cycle {_format_float(cycle_score, 1)}" if cycle_score is not None else "Cycle n/a"
     fear_text = f"Fear & Greed {_format_float(fear_greed, 0)}" if fear_greed is not None else "Fear & Greed n/a"
     reason_text = ", ".join(key_reasons[:3]) if key_reasons else "No dominant edge"
-    note = f"{state} | B{buy_score}/S{sell_score} | {cycle_text} | {td_label} | {fear_text} | {reason_text}"
+    note = (
+        f"{state} | {regime} | B{buy_score}/S{sell_score} | "
+        f"Setup {int(buy_setup_active)}/{int(sell_setup_active)} | Trigger {int(buy_trigger)}/{int(sell_trigger)} | "
+        f"{cycle_text} | {td_label} | {fear_text} | {reason_text}"
+    )
 
     return {
         "State": state,
+        "Regime": regime,
         "BuyScore": buy_score,
         "SellScore": sell_score,
+        "BuySetupActive": buy_setup_active,
+        "SellSetupActive": sell_setup_active,
+        "BuyTrigger": buy_trigger,
+        "SellTrigger": sell_trigger,
         "SignalNote": note,
         "BuyReasonText": " | ".join(buy_reasons),
         "SellReasonText": " | ".join(sell_reasons),
     }
+
+
+def _compose_signal_note(row: pd.Series, state: str) -> str:
+    buy_score = int(row.get("BuyScore", 0) or 0)
+    sell_score = int(row.get("SellScore", 0) or 0)
+    regime = str(row.get("Regime", "n/a"))
+    td_label = str(row.get("TDLabel", "Unavailable"))
+    cycle_score = _coerce_float(row.get("CycleScore"))
+    fear_greed = _coerce_float(row.get("FearGreed"))
+    if state in {"Strong Buy", "Buy Watch"}:
+        reason_source = str(row.get("BuyReasonText", ""))
+    elif state in {"Strong Sell", "Trim"}:
+        reason_source = str(row.get("SellReasonText", ""))
+    else:
+        neutral_parts = [str(row.get("BuyReasonText", "")).split(" | ")[0], str(row.get("SellReasonText", "")).split(" | ")[0]]
+        reason_source = " | ".join(part for part in neutral_parts if part)
+    reason_parts = [part for part in reason_source.split(" | ") if part][:3]
+    cycle_text = f"Cycle {_format_float(cycle_score, 1)}" if cycle_score is not None else "Cycle n/a"
+    fear_text = f"Fear & Greed {_format_float(fear_greed, 0)}" if fear_greed is not None else "Fear & Greed n/a"
+    reason_text = ", ".join(reason_parts) if reason_parts else "No dominant edge"
+    return (
+        f"{state} | {regime} | B{buy_score}/S{sell_score} | "
+        f"Setup {int(_coerce_bool(row.get('BuySetupWindow', row.get('BuySetupActive', False))))}/"
+        f"{int(_coerce_bool(row.get('SellSetupWindow', row.get('SellSetupActive', False))))} | "
+        f"Trigger {int(_coerce_bool(row.get('BuyTrigger', False)))}/{int(_coerce_bool(row.get('SellTrigger', False)))} | "
+        f"{cycle_text} | {td_label} | {fear_text} | {reason_text}"
+    )
 
 
 def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
@@ -915,8 +1235,75 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         return frame
 
     state_rows = [build_signal_state(row, preset) for row in frame.to_dict("records")]
-    state_frame = pd.DataFrame(state_rows, index=frame.index)
-    return frame.join(state_frame, how="left")
+    state_frame = frame.join(pd.DataFrame(state_rows, index=frame.index), how="left")
+    setup_window = max(3, min(6, preset.cooldown_bars + 1))
+    state_frame["BuySetupWindow"] = state_frame["BuySetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
+    state_frame["SellSetupWindow"] = state_frame["SellSetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
+
+    updated_buy_trigger: list[bool] = []
+    updated_sell_trigger: list[bool] = []
+    updated_state: list[str] = []
+    updated_note: list[str] = []
+
+    for row in state_frame.to_dict("records"):
+        buy_score = int(row.get("BuyScore", 0) or 0)
+        sell_score = int(row.get("SellScore", 0) or 0)
+        regime = str(row.get("Regime", "Range / Transition"))
+        bull_regime = _is_bull_regime(regime)
+        bear_regime = _is_bear_regime(regime)
+        buy_trigger = _coerce_bool(row.get("BuyTrigger", False))
+        sell_trigger = _coerce_bool(row.get("SellTrigger", False))
+        buy_window = _coerce_bool(row.get("BuySetupWindow", False))
+        sell_window = _coerce_bool(row.get("SellSetupWindow", False))
+        close_up_day = _coerce_bool(row.get("CloseUpDay", False))
+        close_down_day = _coerce_bool(row.get("CloseDownDay", False))
+        stop_touched = _coerce_bool(row.get("StopTouched", False))
+        volume_ratio = _coerce_float(row.get("VolumeRatio20"))
+        mfi_change = _coerce_float(row.get("MFIChange5"))
+        rs_percentile = _coerce_float(row.get("RSPercentile"))
+        buy_flow_support = bool(
+            (volume_ratio is not None and volume_ratio >= 1.02)
+            or (mfi_change is not None and mfi_change >= 2.0)
+            or (rs_percentile is not None and rs_percentile >= 45.0)
+        )
+        sell_flow_support = bool(
+            (volume_ratio is not None and volume_ratio >= 1.02)
+            or (mfi_change is not None and mfi_change <= -2.0)
+            or (rs_percentile is not None and rs_percentile <= 40.0)
+        )
+
+        if not buy_trigger and buy_window and close_up_day and buy_score >= max(preset.watch_threshold + 2, sell_score + 2):
+            if buy_flow_support or bull_regime or buy_score >= preset.strong_threshold - 4 or _coerce_bool(row.get("BuyTriggerPrice", False)):
+                buy_trigger = True
+        if not sell_trigger and sell_window and close_down_day and sell_score >= max(preset.watch_threshold + 4, buy_score + 6):
+            if sell_flow_support and (bear_regime or stop_touched or _coerce_bool(row.get("SellTriggerPrice", False))):
+                sell_trigger = True
+
+        buy_strong_threshold = preset.strong_threshold - 5 if bull_regime else preset.strong_threshold
+        sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_touched else preset.strong_threshold
+        if sell_trigger and (stop_touched or sell_score >= max(sell_strong_threshold, buy_score + 4)):
+            state = "Strong Sell"
+        elif buy_trigger and buy_score >= max(preset.watch_threshold, buy_strong_threshold) and buy_score >= sell_score - 5:
+            state = "Strong Buy"
+        elif buy_window and buy_score >= preset.watch_threshold - 6 and buy_score >= sell_score - 12:
+            state = "Buy Watch"
+        elif sell_window and sell_score >= preset.watch_threshold - 3 and sell_score > buy_score + 2:
+            state = "Trim"
+        else:
+            state = "Hold / Neutral"
+
+        row["BuyTrigger"] = buy_trigger
+        row["SellTrigger"] = sell_trigger
+        updated_buy_trigger.append(buy_trigger)
+        updated_sell_trigger.append(sell_trigger)
+        updated_state.append(state)
+        updated_note.append(_compose_signal_note(pd.Series(row), state))
+
+    state_frame["BuyTrigger"] = updated_buy_trigger
+    state_frame["SellTrigger"] = updated_sell_trigger
+    state_frame["State"] = updated_state
+    state_frame["SignalNote"] = updated_note
+    return state_frame
 
 
 def build_snapshot(
@@ -1005,43 +1392,30 @@ def build_trade_replay_from_state_frame(
         timestamp = pd.Timestamp(row.Date)
         state = str(row.State)
         price = float(row.Close)
-        stop_breached = bool(pd.notna(row.ChandelierStop) and price <= float(row.ChandelierStop))
+        low_price = float(getattr(row, "Low", price))
+        stop_price = float(row.ChandelierStop) if pd.notna(getattr(row, "ChandelierStop", np.nan)) else np.nan
+        stop_breached = bool(
+            _coerce_bool(getattr(row, "StopTouched", False))
+            or (pd.notna(stop_price) and low_price <= stop_price)
+        )
         note = str(row.SignalNote)
         buy_score = int(row.BuyScore)
         sell_score = int(row.SellScore)
+        buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", state == "Strong Buy"))
+        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", state == "Strong Sell")) or stop_breached
+        sell_setup_active = _coerce_bool(getattr(row, "SellSetupActive", state in {"Trim", "Strong Sell"}))
 
-        ema50_value = getattr(row, "EMA50", np.nan)
-        ema200_value = getattr(row, "EMA200", np.nan)
-        trend_delta_value = getattr(row, "TrendDelta5", np.nan)
-        trend_supportive = bool(
-            pd.notna(ema50_value)
-            and pd.notna(ema200_value)
-            and pd.notna(trend_delta_value)
-            and price >= float(ema200_value)
-            and float(ema50_value) >= float(ema200_value)
-            and float(trend_delta_value) >= 0
-        )
-        trend_weak = bool(
-            (pd.notna(ema50_value) and price < float(ema50_value))
-            or (pd.notna(ema50_value) and pd.notna(ema200_value) and float(ema50_value) < float(ema200_value))
-            or (pd.notna(trend_delta_value) and float(trend_delta_value) < 0)
-        )
-        stop_exit_ready = stop_breached and (
-            trend_weak
-            or sell_score >= max(45, preset.watch_threshold - 5)
-        )
-
-        entry_signal = state == "Strong Buy" or (state == "Buy Watch" and trend_supportive and buy_score >= sell_score)
-        buy_ready = (not in_position) and entry_signal and (position - last_buy_index) >= preset.cooldown_bars
+        buy_ready = (not in_position) and buy_trigger and (position - last_buy_index) >= preset.cooldown_bars
         partial_ready = (
             in_position
             and (not partial_taken)
             and state == "Trim"
+            and sell_setup_active
             and (position - last_partial_index) >= preset.cooldown_bars
         )
         sell_ready = (
             in_position
-            and (state == "Strong Sell" or stop_exit_ready)
+            and sell_trigger
             and (position - last_sell_index) >= preset.cooldown_bars
         )
 
@@ -1093,7 +1467,8 @@ def build_trade_replay_from_state_frame(
             continue
 
         if sell_ready and entry_price is not None and entry_date is not None and position_remaining > 0:
-            realized_return += position_remaining * (price / entry_price - 1.0)
+            exit_price = stop_price if stop_breached and pd.notna(stop_price) else price
+            realized_return += position_remaining * (exit_price / entry_price - 1.0)
             last_sell_index = position
             events.append(
                 {
@@ -1101,12 +1476,12 @@ def build_trade_replay_from_state_frame(
                     "Trade": trade_id,
                     "Date": timestamp,
                     "Signal": "SELL",
-                    "Price": price,
+                    "Price": exit_price,
                     "State": state,
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
                     "PositionAfter": 0.0,
-                    "Reason": note,
+                    "Reason": "Trailing stop touched" if stop_breached and pd.notna(stop_price) else note,
                 }
             )
             trades.append(
@@ -1117,7 +1492,7 @@ def build_trade_replay_from_state_frame(
                     "EntryDate": entry_date,
                     "ExitDate": timestamp,
                     "EntryPrice": entry_price,
-                    "ExitPrice": price,
+                    "ExitPrice": exit_price,
                     "Return": realized_return,
                     "HoldDays": int((timestamp - entry_date).days),
                     "PartialScaledOut": "Yes" if partial_taken else "No",
@@ -1161,56 +1536,51 @@ def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) ->
     markers: list[dict[str, Any]] = []
     last_buy_index = -10_000
     last_sell_index = -10_000
-    previous_buy_active = False
-    previous_sell_active = False
     iter_frame = state_frame.reset_index().rename(columns={"index": "Date"})
 
     for position, row in enumerate(iter_frame.itertuples(index=False)):
-        ema50_value = getattr(row, "EMA50", np.nan)
-        ema200_value = getattr(row, "EMA200", np.nan)
-        trend_delta_value = getattr(row, "TrendDelta5", np.nan)
-        trend_supportive = bool(
-            pd.notna(ema50_value)
-            and pd.notna(ema200_value)
-            and pd.notna(trend_delta_value)
-            and float(row.Close) >= float(ema200_value)
-            and float(ema50_value) >= float(ema200_value)
-            and float(trend_delta_value) >= 0
+        price = float(row.Close)
+        stop_price = float(row.ChandelierStop) if pd.notna(getattr(row, "ChandelierStop", np.nan)) else np.nan
+        low_price = float(getattr(row, "Low", price))
+        stop_breached = bool(
+            _coerce_bool(getattr(row, "StopTouched", False))
+            or (pd.notna(stop_price) and low_price <= stop_price)
         )
-        buy_active = str(row.State) == "Strong Buy" or (str(row.State) == "Buy Watch" and trend_supportive and int(row.BuyScore) >= int(row.SellScore))
-        stop_breached = bool(pd.notna(row.ChandelierStop) and float(row.Close) <= float(row.ChandelierStop))
-        sell_active = str(row.State) == "Strong Sell" or stop_breached
+        buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", str(row.State) == "Strong Buy"))
+        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", str(row.State) == "Strong Sell")) or stop_breached
 
-        buy_trigger = buy_active and not previous_buy_active and (position - last_buy_index) >= preset.cooldown_bars
-        sell_trigger = sell_active and not previous_sell_active and (position - last_sell_index) >= preset.cooldown_bars
+        if buy_trigger and sell_trigger:
+            if int(row.SellScore) >= int(row.BuyScore):
+                buy_trigger = False
+            else:
+                sell_trigger = False
 
         if buy_trigger:
-            last_buy_index = position
-            markers.append(
-                {
-                    "Date": pd.Timestamp(row.Date),
-                    "Signal": "BUY",
-                    "Price": float(row.Close),
-                    "State": str(row.State),
-                    "BuyScore": int(row.BuyScore),
-                    "SellScore": int(row.SellScore),
-                }
-            )
+            if (position - last_buy_index) >= preset.cooldown_bars:
+                last_buy_index = position
+                markers.append(
+                    {
+                        "Date": pd.Timestamp(row.Date),
+                        "Signal": "BUY",
+                        "Price": price,
+                        "State": str(row.State),
+                        "BuyScore": int(row.BuyScore),
+                        "SellScore": int(row.SellScore),
+                    }
+                )
         if sell_trigger:
-            last_sell_index = position
-            markers.append(
-                {
-                    "Date": pd.Timestamp(row.Date),
-                    "Signal": "SELL",
-                    "Price": float(row.Close),
-                    "State": str(row.State),
-                    "BuyScore": int(row.BuyScore),
-                    "SellScore": int(row.SellScore),
-                }
-            )
-
-        previous_buy_active = buy_active
-        previous_sell_active = sell_active
+            if (position - last_sell_index) >= preset.cooldown_bars:
+                last_sell_index = position
+                markers.append(
+                    {
+                        "Date": pd.Timestamp(row.Date),
+                        "Signal": "SELL",
+                        "Price": stop_price if stop_breached and pd.notna(stop_price) else price,
+                        "State": str(row.State),
+                        "BuyScore": int(row.BuyScore),
+                        "SellScore": int(row.SellScore),
+                    }
+                )
 
     return pd.DataFrame(markers)
 
@@ -1493,6 +1863,7 @@ def render_ticker_panel(
     preset: SignalPreset,
 ) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
+    latest = state_frame.dropna(subset=["Close"]).iloc[-1]
     left, right = st.columns([1.65, 1.0])
     with left:
         st.plotly_chart(build_price_context_figure(selected_ticker, state_frame, chart_signal_frame, preset), width="stretch", config={"displaylogo": False})
@@ -1517,8 +1888,12 @@ def render_ticker_panel(
                 {"Field": "TDLabel", "Value": snapshot.td_label},
                 {"Field": "ATRStretch", "Value": _format_float(snapshot.atr_stretch, 2)},
                 {"Field": "RSI", "Value": _format_float(snapshot.rsi, 1)},
+                {"Field": "MFI", "Value": _format_float(_coerce_float(latest.get("MFI")), 1)},
+                {"Field": "ADX", "Value": _format_float(_coerce_float(latest.get("ADX")), 1)},
+                {"Field": "RSPercentile", "Value": _format_float(_coerce_float(latest.get("RSPercentile")), 1)},
                 {"Field": "FearGreed", "Value": _format_float(snapshot.fear_greed, 0)},
                 {"Field": "StopDistance", "Value": _format_pct(snapshot.stop_distance)},
+                {"Field": "Regime", "Value": str(latest.get("Regime", "n/a"))},
                 {"Field": "As Of", "Value": snapshot.as_of.date().isoformat()},
             ]
         )
@@ -1774,7 +2149,11 @@ def main() -> None:
                 warnings.append(f"{ticker}: {warning}")
             if price_frame.empty:
                 continue
-            indicators = compute_indicators(price_frame, macro_data["score_series"])
+            indicators = compute_indicators(
+                price_frame,
+                macro_data["score_series"],
+                macro_data.get("benchmark_close"),
+            )
             state_frame = build_state_frame(indicators, preset)
             if state_frame.empty:
                 warnings.append(f"{ticker}: indicator stack could not build a usable state frame")
