@@ -7,6 +7,7 @@ import io
 import logging
 import re
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -620,6 +621,27 @@ def td_label_from_row(row: pd.Series) -> str:
     return "No exhaustion signal"
 
 
+def build_td_label_series(frame: pd.DataFrame) -> pd.Series:
+    buy_setup = pd.to_numeric(frame["BuySetup"], errors="coerce").fillna(0).astype(int)
+    sell_setup = pd.to_numeric(frame["SellSetup"], errors="coerce").fillna(0).astype(int)
+    buy_countdown = pd.to_numeric(frame["BuyCountdown"], errors="coerce").fillna(0).astype(int)
+    sell_countdown = pd.to_numeric(frame["SellCountdown"], errors="coerce").fillna(0).astype(int)
+
+    labels = pd.Series("No exhaustion signal", index=frame.index, dtype="object")
+    sell_setup_mask = sell_setup >= 7
+    buy_setup_mask = buy_setup >= 7
+    sell_countdown_mask = sell_countdown == 13
+    buy_countdown_mask = buy_countdown == 13
+
+    if sell_setup_mask.any():
+        labels.loc[sell_setup_mask] = sell_setup.loc[sell_setup_mask].map(lambda value: f"Sell setup {value}")
+    if buy_setup_mask.any():
+        labels.loc[buy_setup_mask] = buy_setup.loc[buy_setup_mask].map(lambda value: f"Buy setup {value}")
+    labels.loc[sell_countdown_mask] = "Sell countdown 13"
+    labels.loc[buy_countdown_mask] = "Buy countdown 13"
+    return labels
+
+
 def compute_indicators(price_df: pd.DataFrame, macro_score_series: pd.Series | None) -> pd.DataFrame:
     frame = normalize_ohlcv_frame(price_df)
     if frame.empty:
@@ -641,7 +663,7 @@ def compute_indicators(price_df: pd.DataFrame, macro_score_series: pd.Series | N
     stl = compute_stl_cycle(work)
     work = work.join(stl, how="left")
     work["TrendDelta5"] = work["Trend"] - work["Trend"].shift(5)
-    work["TDLabel"] = work.apply(td_label_from_row, axis=1)
+    work["TDLabel"] = build_td_label_series(work)
 
     if macro_score_series is None or macro_score_series.empty:
         work["FearGreed"] = 50.0
@@ -799,7 +821,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     return max(0, min(100, int(round(score)))), reasons[:5]
 
 
-def build_signal_state(row: pd.Series, preset: SignalPreset) -> dict[str, Any]:
+def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     buy_score, buy_reasons = score_buy_signal(row)
     sell_score, sell_reasons = score_sell_signal(row)
     stop_breached = bool(pd.notna(row.get("ChandelierStop")) and row["Close"] <= row["ChandelierStop"])
@@ -843,9 +865,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     if frame.empty:
         return frame
 
-    state_rows: list[dict[str, Any]] = []
-    for _, row in frame.iterrows():
-        state_rows.append(build_signal_state(row, preset))
+    state_rows = [build_signal_state(row, preset) for row in frame.to_dict("records")]
     state_frame = pd.DataFrame(state_rows, index=frame.index)
     return frame.join(state_frame, how="left")
 
@@ -918,8 +938,8 @@ def build_trade_replay_from_state_frame(
         }
         return pd.DataFrame(), pd.DataFrame(), empty_summary
 
-    events: list[ReplayEvent] = []
-    trades: list[ReplayTrade] = []
+    events: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
     in_position = False
     partial_taken = False
     trade_id = 0
@@ -930,12 +950,16 @@ def build_trade_replay_from_state_frame(
     last_buy_index = -10_000
     last_sell_index = -10_000
     last_partial_index = -10_000
+    iter_frame = state_frame.reset_index().rename(columns={"index": "Date"})
 
-    for position, (timestamp, row) in enumerate(state_frame.iterrows()):
-        state = str(row.get("State", "Hold / Neutral"))
-        price = float(row["Close"])
-        stop_breached = bool(pd.notna(row.get("ChandelierStop")) and price <= float(row["ChandelierStop"]))
-        note = str(row.get("SignalNote", state))
+    for position, row in enumerate(iter_frame.itertuples(index=False)):
+        timestamp = pd.Timestamp(row.Date)
+        state = str(row.State)
+        price = float(row.Close)
+        stop_breached = bool(pd.notna(row.ChandelierStop) and price <= float(row.ChandelierStop))
+        note = str(row.SignalNote)
+        buy_score = int(row.BuyScore)
+        sell_score = int(row.SellScore)
 
         buy_ready = (not in_position) and state == "Strong Buy" and (position - last_buy_index) >= preset.cooldown_bars
         partial_ready = (
@@ -960,18 +984,18 @@ def build_trade_replay_from_state_frame(
             realized_return = 0.0
             last_buy_index = position
             events.append(
-                ReplayEvent(
-                    ticker=ticker,
-                    trade=trade_id,
-                    date=pd.Timestamp(timestamp),
-                    signal="BUY",
-                    price=price,
-                    state=state,
-                    buy_score=int(row.get("BuyScore", 0)),
-                    sell_score=int(row.get("SellScore", 0)),
-                    position_after=position_remaining,
-                    reason=note,
-                )
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Date": timestamp,
+                    "Signal": "BUY",
+                    "Price": price,
+                    "State": state,
+                    "BuyScore": buy_score,
+                    "SellScore": sell_score,
+                    "PositionAfter": position_remaining,
+                    "Reason": note,
+                }
             )
             continue
 
@@ -982,18 +1006,18 @@ def build_trade_replay_from_state_frame(
             partial_taken = position_remaining > 0
             last_partial_index = position
             events.append(
-                ReplayEvent(
-                    ticker=ticker,
-                    trade=trade_id,
-                    date=pd.Timestamp(timestamp),
-                    signal="PARTIAL SELL",
-                    price=price,
-                    state=state,
-                    buy_score=int(row.get("BuyScore", 0)),
-                    sell_score=int(row.get("SellScore", 0)),
-                    position_after=position_remaining,
-                    reason=note,
-                )
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Date": timestamp,
+                    "Signal": "PARTIAL SELL",
+                    "Price": price,
+                    "State": state,
+                    "BuyScore": buy_score,
+                    "SellScore": sell_score,
+                    "PositionAfter": position_remaining,
+                    "Reason": note,
+                }
             )
             continue
 
@@ -1001,32 +1025,32 @@ def build_trade_replay_from_state_frame(
             realized_return += position_remaining * (price / entry_price - 1.0)
             last_sell_index = position
             events.append(
-                ReplayEvent(
-                    ticker=ticker,
-                    trade=trade_id,
-                    date=pd.Timestamp(timestamp),
-                    signal="SELL",
-                    price=price,
-                    state=state,
-                    buy_score=int(row.get("BuyScore", 0)),
-                    sell_score=int(row.get("SellScore", 0)),
-                    position_after=0.0,
-                    reason=note,
-                )
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Date": timestamp,
+                    "Signal": "SELL",
+                    "Price": price,
+                    "State": state,
+                    "BuyScore": buy_score,
+                    "SellScore": sell_score,
+                    "PositionAfter": 0.0,
+                    "Reason": note,
+                }
             )
             trades.append(
-                ReplayTrade(
-                    ticker=ticker,
-                    trade=trade_id,
-                    status="Closed",
-                    entry_date=entry_date,
-                    exit_date=pd.Timestamp(timestamp),
-                    entry_price=entry_price,
-                    exit_price=price,
-                    total_return=realized_return,
-                    hold_days=int((pd.Timestamp(timestamp) - entry_date).days),
-                    partial_scaled_out="Yes" if partial_taken else "No",
-                )
+                {
+                    "Ticker": ticker,
+                    "Trade": trade_id,
+                    "Status": "Closed",
+                    "EntryDate": entry_date,
+                    "ExitDate": timestamp,
+                    "EntryPrice": entry_price,
+                    "ExitPrice": price,
+                    "Return": realized_return,
+                    "HoldDays": int((timestamp - entry_date).days),
+                    "PartialScaledOut": "Yes" if partial_taken else "No",
+                }
             )
             in_position = False
             partial_taken = False
@@ -1040,53 +1064,73 @@ def build_trade_replay_from_state_frame(
         last_price = float(state_frame["Close"].iloc[-1])
         mark_to_market = realized_return + (position_remaining * (last_price / entry_price - 1.0))
         trades.append(
-            ReplayTrade(
-                ticker=ticker,
-                trade=trade_id,
-                status="Open",
-                entry_date=entry_date,
-                exit_date=last_timestamp,
-                entry_price=entry_price,
-                exit_price=last_price,
-                total_return=mark_to_market,
-                hold_days=int((last_timestamp - entry_date).days),
-                partial_scaled_out="Yes" if partial_taken else "No",
-            )
+            {
+                "Ticker": ticker,
+                "Trade": trade_id,
+                "Status": "Open",
+                "EntryDate": entry_date,
+                "ExitDate": last_timestamp,
+                "EntryPrice": entry_price,
+                "ExitPrice": last_price,
+                "Return": mark_to_market,
+                "HoldDays": int((last_timestamp - entry_date).days),
+                "PartialScaledOut": "Yes" if partial_taken else "No",
+            }
         )
 
-    event_frame = pd.DataFrame([asdict(event) for event in events])
-    trade_frame = pd.DataFrame([asdict(trade) for trade in trades])
-    if not trade_frame.empty:
-        trade_frame = trade_frame.rename(
-            columns={
-                "ticker": "Ticker",
-                "trade": "Trade",
-                "status": "Status",
-                "entry_date": "EntryDate",
-                "exit_date": "ExitDate",
-                "entry_price": "EntryPrice",
-                "exit_price": "ExitPrice",
-                "total_return": "Return",
-                "hold_days": "HoldDays",
-                "partial_scaled_out": "PartialScaledOut",
-            }
-        )
-    if not event_frame.empty:
-        event_frame = event_frame.rename(
-            columns={
-                "ticker": "Ticker",
-                "trade": "Trade",
-                "date": "Date",
-                "signal": "Signal",
-                "price": "Price",
-                "state": "State",
-                "buy_score": "BuyScore",
-                "sell_score": "SellScore",
-                "position_after": "PositionAfter",
-                "reason": "Reason",
-            }
-        )
+    event_frame = pd.DataFrame(events)
+    trade_frame = pd.DataFrame(trades)
     return event_frame, trade_frame, build_replay_summary(trade_frame)
+
+
+def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
+    if state_frame.empty:
+        return pd.DataFrame(columns=["Date", "Signal", "Price", "State", "BuyScore", "SellScore"])
+
+    markers: list[dict[str, Any]] = []
+    last_buy_index = -10_000
+    last_sell_index = -10_000
+    previous_buy_active = False
+    previous_sell_active = False
+    iter_frame = state_frame.reset_index().rename(columns={"index": "Date"})
+
+    for position, row in enumerate(iter_frame.itertuples(index=False)):
+        buy_active = str(row.State) == "Strong Buy"
+        stop_breached = bool(pd.notna(row.ChandelierStop) and float(row.Close) <= float(row.ChandelierStop))
+        sell_active = str(row.State) == "Strong Sell" or stop_breached
+
+        buy_trigger = buy_active and not previous_buy_active and (position - last_buy_index) >= preset.cooldown_bars
+        sell_trigger = sell_active and not previous_sell_active and (position - last_sell_index) >= preset.cooldown_bars
+
+        if buy_trigger:
+            last_buy_index = position
+            markers.append(
+                {
+                    "Date": pd.Timestamp(row.Date),
+                    "Signal": "BUY",
+                    "Price": float(row.Close),
+                    "State": str(row.State),
+                    "BuyScore": int(row.BuyScore),
+                    "SellScore": int(row.SellScore),
+                }
+            )
+        if sell_trigger:
+            last_sell_index = position
+            markers.append(
+                {
+                    "Date": pd.Timestamp(row.Date),
+                    "Signal": "SELL",
+                    "Price": float(row.Close),
+                    "State": str(row.State),
+                    "BuyScore": int(row.BuyScore),
+                    "SellScore": int(row.SellScore),
+                }
+            )
+
+        previous_buy_active = buy_active
+        previous_sell_active = sell_active
+
+    return pd.DataFrame(markers)
 
 
 def build_price_context_figure(
@@ -1095,46 +1139,24 @@ def build_price_context_figure(
     event_frame: pd.DataFrame,
     preset: SignalPreset,
 ) -> go.Figure:
-    plot_frame = state_frame.copy().reset_index().rename(columns={"index": "Date"})
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.56, 0.24, 0.20],
-        specs=[[{}], [{}], [{"secondary_y": True}]],
-    )
-    fig.add_trace(
-        go.Candlestick(
-            x=plot_frame["Date"],
-            open=plot_frame["Open"],
-            high=plot_frame["High"],
-            low=plot_frame["Low"],
-            close=plot_frame["Close"],
-            name="Price",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["EMA20"], name="EMA20", line={"color": "#2563eb", "width": 1.6}), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["EMA50"], name="EMA50", line={"color": "#0f766e", "width": 1.6}), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["EMA200"], name="EMA200", line={"color": "#111827", "width": 1.4, "dash": "dot"}), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["Trend"], name="STL Trend", line={"color": "#16a34a", "width": 2.0}), row=1, col=1)
+    del preset
+    plot_frame = state_frame.loc[:, ["Close", "BuyScore", "SellScore", "State"]].copy().reset_index().rename(columns={"index": "Date"})
+    fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=plot_frame["Date"],
-            y=plot_frame["ChandelierStop"],
-            name="Chandelier Stop",
-            line={"color": "#dc2626", "width": 1.8, "dash": "dash"},
-        ),
-        row=1,
-        col=1,
+            y=plot_frame["Close"],
+            mode="lines",
+            name="Close",
+            line={"color": "#0f172a", "width": 2.2},
+            hovertemplate="Date %{x|%Y-%m-%d}<br>Close %{y:.2f}<br>Buy %{customdata[0]} / Sell %{customdata[1]}<extra></extra>",
+            customdata=plot_frame[["BuyScore", "SellScore"]],
+        )
     )
 
     if not event_frame.empty:
         marker_styles = {
             "BUY": {"color": "#16a34a", "symbol": "triangle-up", "textposition": "bottom center"},
-            "PARTIAL SELL": {"color": "#d97706", "symbol": "diamond", "textposition": "top center"},
             "SELL": {"color": "#dc2626", "symbol": "triangle-down", "textposition": "top center"},
         }
         for signal, style in marker_styles.items():
@@ -1150,57 +1172,28 @@ def build_price_context_figure(
                     textposition=style["textposition"],
                     name=signal,
                     marker={
-                        "size": 12,
+                        "size": 14,
                         "color": style["color"],
                         "symbol": style["symbol"],
                         "line": {"width": 1, "color": "#ffffff"},
                     },
-                    customdata=subset[["State", "Reason"]],
+                    customdata=subset[["State", "BuyScore", "SellScore"]],
                     hovertemplate=(
-                        "%{x|%Y-%m-%d}<br>Price %{y:.2f}<br>%{customdata[0]}"
-                        "<br>%{customdata[1]}<extra></extra>"
+                        "%{x|%Y-%m-%d}<br>%{customdata[0]}<br>Price %{y:.2f}"
+                        "<br>Buy %{customdata[1]} / Sell %{customdata[2]}<extra></extra>"
                     ),
-                ),
-                row=1,
-                col=1,
+                )
             )
 
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["CycleScore"], name="CycleScore", line={"color": "#f59e0b", "width": 2.0}), row=2, col=1)
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["BuyScore"], name="BuyScore", line={"color": "#16a34a", "width": 1.8}), row=2, col=1)
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["SellScore"], name="SellScore", line={"color": "#dc2626", "width": 1.8}), row=2, col=1)
-    fig.add_hline(y=preset.strong_threshold, row=2, col=1, line_dash="dot", line_color="#64748b")
-    fig.add_hline(y=preset.watch_threshold, row=2, col=1, line_dash="dash", line_color="#94a3b8")
-    fig.add_hrect(y0=0, y1=20, fillcolor="rgba(37,99,235,0.07)", line_width=0, row=2, col=1)
-    fig.add_hrect(y0=80, y1=100, fillcolor="rgba(220,38,38,0.07)", line_width=0, row=2, col=1)
-
-    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["RSI"], name="RSI", line={"color": "#7c3aed", "width": 1.8}), row=3, col=1, secondary_y=False)
-    fig.add_trace(
-        go.Scatter(
-            x=plot_frame["Date"],
-            y=plot_frame["ATRStretch"],
-            name="ATR Stretch",
-            line={"color": "#ea580c", "width": 1.8},
-        ),
-        row=3,
-        col=1,
-        secondary_y=True,
-    )
-    fig.add_hline(y=35, row=3, col=1, line_dash="dot", line_color="#2563eb", secondary_y=False)
-    fig.add_hline(y=68, row=3, col=1, line_dash="dot", line_color="#dc2626", secondary_y=False)
-    fig.add_hline(y=-1.0, row=3, col=1, line_dash="dash", line_color="#2563eb", secondary_y=True)
-    fig.add_hline(y=1.0, row=3, col=1, line_dash="dash", line_color="#dc2626", secondary_y=True)
-
     fig.update_layout(
-        title=f"{ticker} Price / Signal Context",
-        height=830,
+        title=f"{ticker} Buy / Sell Signal Overlay",
+        height=520,
         margin={"l": 12, "r": 12, "t": 52, "b": 10},
         xaxis_rangeslider_visible=False,
-        legend={"orientation": "h", "y": 1.05},
+        legend={"orientation": "h", "y": 1.04},
+        hovermode="x unified",
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Score", range=[0, 100], row=2, col=1)
-    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Stretch", row=3, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Price")
     return fig
 
 
@@ -1384,9 +1377,8 @@ def render_signal_review(event_frame: pd.DataFrame, trade_frame: pd.DataFrame, s
             display = event_frame.sort_values("Date", ascending=False).copy()
             display["Date"] = display["Date"].dt.date
             display["Price"] = display["Price"].map(_format_float)
-            display["PositionAfter"] = display["PositionAfter"].map(lambda value: f"{value:.2f}x")
             st.dataframe(
-                display.loc[:, ["Date", "Signal", "Price", "State", "BuyScore", "SellScore", "PositionAfter", "Reason"]],
+                display.loc[:, ["Date", "Signal", "Price", "State", "BuyScore", "SellScore"]],
                 width="stretch",
                 hide_index=True,
             )
@@ -1412,49 +1404,63 @@ def render_ticker_panel(
     selected_ticker: str,
     snapshot: TickerSnapshot,
     state_frame: pd.DataFrame,
+    chart_signal_frame: pd.DataFrame,
     event_frame: pd.DataFrame,
     trade_frame: pd.DataFrame,
     replay_summary: dict[str, float | int | None],
-    macro_data: dict[str, Any],
-    history_years: int,
     preset: SignalPreset,
 ) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
     left, right = st.columns([1.65, 1.0])
     with left:
-        st.plotly_chart(build_price_context_figure(selected_ticker, state_frame, event_frame, preset), width="stretch", config={"displaylogo": False})
+        st.plotly_chart(build_price_context_figure(selected_ticker, state_frame, chart_signal_frame, preset), width="stretch", config={"displaylogo": False})
     with right:
-        st.plotly_chart(build_macro_figure(macro_data, history_years), width="stretch", config={"displaylogo": False})
+        score_cards_top = st.columns(2)
+        with score_cards_top[0]:
+            render_metric_card("Current State", snapshot.state, f"Resolved {snapshot.resolved_symbol}")
+        with score_cards_top[1]:
+            render_metric_card("Score Spread", str(snapshot.buy_score - snapshot.sell_score), "BuyScore minus SellScore")
+
+        score_cards_bottom = st.columns(2)
+        with score_cards_bottom[0]:
+            render_metric_card("BuyScore", str(snapshot.buy_score), "Composite buy score")
+        with score_cards_bottom[1]:
+            render_metric_card("SellScore", str(snapshot.sell_score), "Composite sell score")
+
         detail = pd.DataFrame(
             [
-                {"Field": "State", "Value": snapshot.state},
-                {"Field": "Resolved symbol", "Value": snapshot.resolved_symbol},
-                {"Field": "BuyScore", "Value": str(snapshot.buy_score)},
-                {"Field": "SellScore", "Value": str(snapshot.sell_score)},
+                {"Field": "Close", "Value": _format_float(snapshot.last_close)},
+                {"Field": "1D Return", "Value": _format_pct(snapshot.daily_return)},
                 {"Field": "CycleScore", "Value": _format_float(snapshot.cycle_score, 1)},
                 {"Field": "TDLabel", "Value": snapshot.td_label},
                 {"Field": "ATRStretch", "Value": _format_float(snapshot.atr_stretch, 2)},
                 {"Field": "RSI", "Value": _format_float(snapshot.rsi, 1)},
                 {"Field": "FearGreed", "Value": _format_float(snapshot.fear_greed, 0)},
                 {"Field": "StopDistance", "Value": _format_pct(snapshot.stop_distance)},
+                {"Field": "As Of", "Value": snapshot.as_of.date().isoformat()},
             ]
         )
         st.dataframe(detail, width="stretch", hide_index=True)
 
-    st.markdown(f"**Current Note**: {snapshot.note}")
-    pills = [
-        f'<span class="pill">{snapshot.state}</span>',
-        f'<span class="pill">B{snapshot.buy_score} / S{snapshot.sell_score}</span>',
-        f'<span class="pill">{snapshot.td_label}</span>',
-        f'<span class="pill">Fear & Greed {_format_score(snapshot.fear_greed)}</span>',
-    ]
-    st.markdown("".join(pills), unsafe_allow_html=True)
     render_signal_review(event_frame, trade_frame, replay_summary)
 
 
-def render_diagnostics(diagnostics: pd.DataFrame) -> None:
+def render_diagnostics(diagnostics: pd.DataFrame, performance_frame: pd.DataFrame) -> None:
     with st.expander("Data diagnostics", expanded=False):
         st.dataframe(diagnostics, width="stretch", hide_index=True)
+        if not performance_frame.empty:
+            st.markdown("**Performance timings (seconds)**")
+            display = performance_frame.copy()
+            display["Seconds"] = display["Seconds"].map(lambda value: f"{value:.4f}")
+            st.dataframe(display, width="stretch", hide_index=True)
+
+
+def build_performance_frame(timing_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    if not timing_rows:
+        return pd.DataFrame(columns=["Stage", "Target", "Seconds", "Rows"])
+    frame = pd.DataFrame(timing_rows)
+    frame["Rows"] = pd.to_numeric(frame["Rows"], errors="coerce").astype("Int64")
+    return frame.sort_values(["Seconds", "Stage", "Target"], ascending=[False, True, True]).reset_index(drop=True)
 
 
 def build_diagnostics_frame(
@@ -1593,6 +1599,26 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
     except Exception as exc:
         record("replay_cooldown_and_orphan_guard", False, str(exc))
 
+    try:
+        preset = PROFILE_PRESETS["Balanced"]
+        marker_index = pd.date_range("2024-04-01", periods=7, freq="B")
+        marker_state = pd.DataFrame(
+            {
+                "Close": [100.0, 101.0, 103.0, 104.0, 102.0, 97.0, 96.0],
+                "ChandelierStop": [90.0, 90.0, 91.0, 92.0, 95.0, 98.0, 99.0],
+                "State": ["Hold / Neutral", "Strong Buy", "Strong Buy", "Buy Watch", "Hold / Neutral", "Strong Sell", "Strong Sell"],
+                "BuyScore": [20, 80, 79, 60, 44, 18, 15],
+                "SellScore": [15, 20, 21, 30, 45, 82, 84],
+            },
+            index=marker_index,
+        )
+        chart_signals = build_chart_signal_frame(marker_state, preset)
+        signals = chart_signals["Signal"].tolist()
+        passed = signals == ["BUY", "SELL"]
+        record("chart_signal_visibility", passed, f"signals={signals}")
+    except Exception as exc:
+        record("chart_signal_visibility", False, str(exc))
+
     return results
 
 
@@ -1611,9 +1637,21 @@ def run_self_tests_cli() -> int:
 
 
 def main() -> None:
+    run_started_at = time.perf_counter()
     configure_page()
     apply_style()
     watchlist, history_years, preset, refresh = build_controls()
+    timing_rows: list[dict[str, Any]] = []
+
+    def add_timing(stage: str, target: str, started_at: float, rows: int | None = None) -> None:
+        timing_rows.append(
+            {
+                "Stage": stage,
+                "Target": target,
+                "Seconds": time.perf_counter() - started_at,
+                "Rows": rows if rows is not None else pd.NA,
+            }
+        )
 
     if refresh:
         st.cache_data.clear()
@@ -1625,9 +1663,13 @@ def main() -> None:
 
     try:
         with st.spinner("Loading watchlist prices and macro context..."):
+            macro_started_at = time.perf_counter()
             macro_data = load_macro_fear_greed_cached(end_date.isoformat())
+            add_timing("load", "macro_fear_greed", macro_started_at, len(macro_data.get("score_series", pd.Series(dtype=float))))
             for ticker in watchlist:
+                ticker_started_at = time.perf_counter()
                 price_payloads[ticker] = download_single_history_cached(ticker, start_date.isoformat(), end_date.isoformat())
+                add_timing("download", ticker, ticker_started_at, len(price_payloads[ticker]["frame"]))
     except Exception as exc:
         st.error("Dashboard data could not be loaded.")
         st.info(str(exc))
@@ -1642,6 +1684,7 @@ def main() -> None:
 
     with st.spinner("Computing indicators, scores, and replay states..."):
         for ticker in watchlist:
+            compute_started_at = time.perf_counter()
             payload = price_payloads[ticker]
             price_frame = payload["frame"]
             warning = payload.get("warning")
@@ -1656,6 +1699,7 @@ def main() -> None:
                 continue
             state_frames[ticker] = state_frame
             snapshots.append(build_snapshot(ticker, payload["resolved_symbol"], state_frame, warning))
+            add_timing("compute", ticker, compute_started_at, len(state_frame))
 
     watchlist_frame = build_watchlist_frame(snapshots)
     render_header(macro_data, snapshots)
@@ -1664,27 +1708,36 @@ def main() -> None:
     render_watchlist_summary(watchlist_frame)
 
     diagnostics = build_diagnostics_frame(watchlist, price_payloads, macro_data)
+    performance_frame = build_performance_frame(timing_rows)
     if watchlist_frame.empty:
-        render_diagnostics(diagnostics)
+        add_timing("total", "app_run", run_started_at)
+        performance_frame = build_performance_frame(timing_rows)
+        render_diagnostics(diagnostics, performance_frame)
         st.stop()
 
     ticker_options = watchlist_frame["ticker"].tolist()
     selected_ticker = st.selectbox("Drill-down ticker", options=ticker_options, index=0)
     selected_snapshot = next(snapshot for snapshot in snapshots if snapshot.ticker == selected_ticker)
     selected_state_frame = state_frames[selected_ticker]
+    chart_started_at = time.perf_counter()
+    chart_signal_frame = build_chart_signal_frame(selected_state_frame, preset)
+    add_timing("chart_signals", selected_ticker, chart_started_at, len(chart_signal_frame))
+    replay_started_at = time.perf_counter()
     event_frame, trade_frame, replay_summary = build_trade_replay_from_state_frame(selected_ticker, selected_state_frame, preset)
+    add_timing("replay", selected_ticker, replay_started_at, len(event_frame))
+    add_timing("total", "app_run", run_started_at)
+    performance_frame = build_performance_frame(timing_rows)
     render_ticker_panel(
         selected_ticker=selected_ticker,
         snapshot=selected_snapshot,
         state_frame=selected_state_frame,
+        chart_signal_frame=chart_signal_frame,
         event_frame=event_frame,
         trade_frame=trade_frame,
         replay_summary=replay_summary,
-        macro_data=macro_data,
-        history_years=history_years,
         preset=preset,
     )
-    render_diagnostics(diagnostics)
+    render_diagnostics(diagnostics, performance_frame)
 
 
 if __name__ == "__main__":
