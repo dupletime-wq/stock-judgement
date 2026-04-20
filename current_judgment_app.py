@@ -689,6 +689,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     rsi = _coerce_float(row.get("RSI"))
     fear_greed = _coerce_float(row.get("FearGreed"))
     close_value = _coerce_float(row.get("Close"))
+    ema20 = _coerce_float(row.get("EMA20"))
     ema50 = _coerce_float(row.get("EMA50"))
     ema200 = _coerce_float(row.get("EMA200"))
     ema50_slope = _coerce_float(row.get("EMA50Slope20"))
@@ -741,6 +742,27 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif fear_greed <= 50:
             score += 8
             reasons.append("Macro neutral-to-fear")
+
+    trend_supportive = all(
+        value is not None
+        for value in [close_value, ema20, ema50, ema200, trend_delta]
+    ) and bool(close_value >= ema200 and ema50 >= ema200 and trend_delta >= 0)
+
+    if trend_supportive and atr_stretch is not None:
+        if atr_stretch <= -0.4:
+            score += 12
+            reasons.append("Trend pullback booster")
+        elif atr_stretch <= 0.0:
+            score += 6
+            reasons.append("Shallow dip in uptrend")
+
+    if trend_supportive and cycle_score is not None and cycle_score <= 55:
+        score += 8
+        reasons.append("Trend + cycle support")
+
+    if trend_supportive and rsi is not None and rsi <= 52:
+        score += 6
+        reasons.append("RSI reset in uptrend")
 
     downtrend_cap = False
     if close_value is not None and ema200 is not None and close_value < ema200:
@@ -799,23 +821,23 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             score += 12
             reasons.append("ATR stretched")
         elif atr_stretch >= 0.5:
-            score += 6
+            score += 4
             reasons.append("ATR mildly extended")
 
     if rsi is not None:
-        if rsi >= 68:
+        if rsi >= 72:
             score += 10
             reasons.append("RSI overbought")
-        elif rsi >= 60:
+        elif rsi >= 64:
             score += 6
             reasons.append("RSI hot")
 
     if fear_greed is not None:
         if fear_greed >= 60:
-            score += 15
+            score += 10
             reasons.append("Macro greed warning")
         elif fear_greed >= 50:
-            score += 8
+            score += 4
             reasons.append("Macro risk appetite")
 
     return max(0, min(100, int(round(score)))), reasons[:5]
@@ -824,20 +846,47 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
 def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     buy_score, buy_reasons = score_buy_signal(row)
     sell_score, sell_reasons = score_sell_signal(row)
+    close_value = _coerce_float(row.get("Close"))
+    ema50 = _coerce_float(row.get("EMA50"))
+    ema200 = _coerce_float(row.get("EMA200"))
+    trend_delta = _coerce_float(row.get("TrendDelta5"))
+    cycle_score = _coerce_float(row.get("CycleScore"))
+    atr_stretch = _coerce_float(row.get("ATRStretch"))
+    rsi = _coerce_float(row.get("RSI"))
+    buy_countdown = int(row.get("BuyCountdown", 0) or 0)
     stop_breached = bool(pd.notna(row.get("ChandelierStop")) and row["Close"] <= row["ChandelierStop"])
+    trend_supportive = all(value is not None for value in [close_value, ema50, ema200, trend_delta]) and bool(close_value >= ema200 and ema50 >= ema200 and trend_delta >= 0)
+    trend_weak = (
+        (close_value is not None and ema50 is not None and close_value < ema50)
+        or (ema50 is not None and ema200 is not None and ema50 < ema200)
+        or (trend_delta is not None and trend_delta < 0)
+    )
+    deep_reversal = bool(
+        (cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
+        or (
+            atr_stretch is not None
+            and rsi is not None
+            and atr_stretch <= -1.5
+            and rsi <= 32
+            and sell_score <= max(20, preset.watch_threshold - 10)
+        )
+    )
 
-    if stop_breached or sell_score >= preset.strong_threshold:
+    if buy_score >= preset.strong_threshold and ((buy_score - sell_score) >= 5 or (deep_reversal and buy_score >= sell_score)):
+        state = "Strong Buy"
+        key_reasons = buy_reasons
+    elif buy_score >= preset.watch_threshold and ((trend_supportive and buy_score >= sell_score) or deep_reversal):
+        state = "Buy Watch"
+        key_reasons = buy_reasons
+    elif sell_score >= preset.strong_threshold and (sell_score - buy_score) >= 8 and trend_weak:
         state = "Strong Sell"
-        key_reasons = sell_reasons if sell_reasons else (["Protective stop breach"] if stop_breached else [])
+        key_reasons = sell_reasons
+    elif stop_breached and trend_weak and sell_score >= max(45, preset.watch_threshold - 5):
+        state = "Strong Sell"
+        key_reasons = sell_reasons if sell_reasons else ["Protective stop breach"]
     elif sell_score >= preset.watch_threshold and (sell_score - buy_score) >= 5:
         state = "Trim"
         key_reasons = sell_reasons
-    elif buy_score >= preset.strong_threshold and (buy_score - sell_score) >= 10:
-        state = "Strong Buy"
-        key_reasons = buy_reasons
-    elif buy_score >= preset.watch_threshold and (buy_score - sell_score) >= 5:
-        state = "Buy Watch"
-        key_reasons = buy_reasons
     else:
         state = "Hold / Neutral"
         key_reasons = buy_reasons[:2] + sell_reasons[:2]
@@ -961,7 +1010,29 @@ def build_trade_replay_from_state_frame(
         buy_score = int(row.BuyScore)
         sell_score = int(row.SellScore)
 
-        buy_ready = (not in_position) and state == "Strong Buy" and (position - last_buy_index) >= preset.cooldown_bars
+        ema50_value = getattr(row, "EMA50", np.nan)
+        ema200_value = getattr(row, "EMA200", np.nan)
+        trend_delta_value = getattr(row, "TrendDelta5", np.nan)
+        trend_supportive = bool(
+            pd.notna(ema50_value)
+            and pd.notna(ema200_value)
+            and pd.notna(trend_delta_value)
+            and price >= float(ema200_value)
+            and float(ema50_value) >= float(ema200_value)
+            and float(trend_delta_value) >= 0
+        )
+        trend_weak = bool(
+            (pd.notna(ema50_value) and price < float(ema50_value))
+            or (pd.notna(ema50_value) and pd.notna(ema200_value) and float(ema50_value) < float(ema200_value))
+            or (pd.notna(trend_delta_value) and float(trend_delta_value) < 0)
+        )
+        stop_exit_ready = stop_breached and (
+            trend_weak
+            or sell_score >= max(45, preset.watch_threshold - 5)
+        )
+
+        entry_signal = state == "Strong Buy" or (state == "Buy Watch" and trend_supportive and buy_score >= sell_score)
+        buy_ready = (not in_position) and entry_signal and (position - last_buy_index) >= preset.cooldown_bars
         partial_ready = (
             in_position
             and (not partial_taken)
@@ -970,7 +1041,7 @@ def build_trade_replay_from_state_frame(
         )
         sell_ready = (
             in_position
-            and (state == "Strong Sell" or stop_breached)
+            and (state == "Strong Sell" or stop_exit_ready)
             and (position - last_sell_index) >= preset.cooldown_bars
         )
 
@@ -1095,7 +1166,18 @@ def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) ->
     iter_frame = state_frame.reset_index().rename(columns={"index": "Date"})
 
     for position, row in enumerate(iter_frame.itertuples(index=False)):
-        buy_active = str(row.State) == "Strong Buy"
+        ema50_value = getattr(row, "EMA50", np.nan)
+        ema200_value = getattr(row, "EMA200", np.nan)
+        trend_delta_value = getattr(row, "TrendDelta5", np.nan)
+        trend_supportive = bool(
+            pd.notna(ema50_value)
+            and pd.notna(ema200_value)
+            and pd.notna(trend_delta_value)
+            and float(row.Close) >= float(ema200_value)
+            and float(ema50_value) >= float(ema200_value)
+            and float(trend_delta_value) >= 0
+        )
+        buy_active = str(row.State) == "Strong Buy" or (str(row.State) == "Buy Watch" and trend_supportive and int(row.BuyScore) >= int(row.SellScore))
         stop_breached = bool(pd.notna(row.ChandelierStop) and float(row.Close) <= float(row.ChandelierStop))
         sell_active = str(row.State) == "Strong Sell" or stop_breached
 
