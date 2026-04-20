@@ -14,8 +14,10 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 import streamlit as st
 from statsmodels.tsa.seasonal import STL
+import urllib3
 import yfinance as yf
 
 
@@ -27,7 +29,9 @@ if "--self-test" in sys.argv:
 APP_TITLE = "Single-File Swing Trading Dashboard"
 CACHE_TTL_SECONDS = 3600
 MACRO_HISTORY_YEARS = 6
-DEFAULT_WATCHLIST = ("SPY", "QQQ", "NVDA", "AAPL", "MSFT", "005930.KS")
+OPTIMIZED_TICKERS = ("SPY", "QQQ", "069500.KS")
+OPTIMIZED_TICKER_SET = set(OPTIMIZED_TICKERS)
+DEFAULT_WATCHLIST = OPTIMIZED_TICKERS
 REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 MACRO_TICKERS = ("SPY", "^VIX", "HYG", "IEF", "RSP", "XLY", "XLP", "UUP")
 KOREAN_TICKER_PATTERN = re.compile(r"^(?P<code>\d{6})(?:\.(?P<suffix>KS|KQ))?$", re.IGNORECASE)
@@ -108,6 +112,8 @@ PROFILE_PRESETS = {
     "Balanced": SignalPreset(name="Balanced", strong_threshold=70, watch_threshold=55, cooldown_bars=5),
     "Conservative": SignalPreset(name="Conservative", strong_threshold=75, watch_threshold=60, cooldown_bars=8),
 }
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def configure_page() -> None:
@@ -231,15 +237,18 @@ def build_controls() -> tuple[list[str], int, SignalPreset, bool]:
     watchlist_raw = st.sidebar.text_area(
         "Watchlist tickers",
         value=", ".join(DEFAULT_WATCHLIST),
-        help="US tickers and Korean six-digit codes are both supported.",
+        help="This version is tuned only for SPY, QQQ, and 069500.KS (KODEX 200 ETF). Other inputs are ignored.",
         height=96,
     )
     history_years = st.sidebar.slider("History lookback (years)", min_value=1, max_value=5, value=3, step=1)
     profile_name = st.sidebar.selectbox("Signal profile", options=list(PROFILE_PRESETS), index=1)
     refresh = st.sidebar.button("Refresh cached data", width="stretch")
-    st.sidebar.caption("Daily-bar swing dashboard built for Streamlit Community Cloud.")
+    st.sidebar.caption("Daily-bar swing dashboard optimized for SPY, QQQ, and KODEX 200 only.")
 
-    watchlist = parse_tickers(watchlist_raw) or list(DEFAULT_WATCHLIST)
+    parsed_watchlist = parse_tickers(watchlist_raw)
+    watchlist = [ticker for ticker in parsed_watchlist if ticker in OPTIMIZED_TICKER_SET]
+    if not watchlist:
+        watchlist = list(DEFAULT_WATCHLIST)
     return watchlist, int(history_years), PROFILE_PRESETS[profile_name], refresh
 
 
@@ -288,6 +297,45 @@ def quiet_yfinance_download(*args: Any, **kwargs: Any) -> pd.DataFrame:
         return yf.download(*args, **kwargs)
 
 
+def download_chart_api_history(symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "period1": int(start_ts.timestamp()),
+        "period2": int(end_ts.timestamp()),
+        "interval": "1d",
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+    response = requests.get(
+        url,
+        params=params,
+        timeout=30,
+        verify=False,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = payload.get("chart", {}).get("result") or []
+    if not result:
+        return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+    chart = result[0]
+    timestamps = chart.get("timestamp") or []
+    quote = ((chart.get("indicators") or {}).get("quote") or [{}])[0]
+    if not timestamps:
+        return pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS))
+    frame = pd.DataFrame(
+        {
+            "Open": quote.get("open", []),
+            "High": quote.get("high", []),
+            "Low": quote.get("low", []),
+            "Close": quote.get("close", []),
+            "Volume": quote.get("volume", []),
+        },
+        index=pd.to_datetime(timestamps, unit="s"),
+    )
+    return normalize_ohlcv_frame(frame)
+
+
 def resolve_yfinance_candidates(ticker: str) -> list[str]:
     normalized = ticker.strip().upper()
     match = KOREAN_TICKER_PATTERN.fullmatch(normalized)
@@ -329,6 +377,18 @@ def download_single_history_cached(requested_ticker: str, start_iso: str, end_is
                 "frame": frame,
                 "warning": None,
             }
+        try:
+            frame = download_chart_api_history(candidate, start_ts, end_ts)
+        except Exception as exc:
+            last_error = f"{candidate}: {exc}"
+            continue
+        if not frame.empty:
+            return {
+                "requested_ticker": requested_ticker,
+                "resolved_symbol": candidate,
+                "frame": frame,
+                "warning": "Used Yahoo chart API fallback due yfinance SSL/rate-limit issue",
+            }
         last_error = f"{candidate}: no usable OHLCV rows returned"
 
     return {
@@ -358,10 +418,27 @@ def _extract_close_panel(raw: pd.DataFrame) -> pd.DataFrame:
     return panel.reindex(columns=list(MACRO_TICKERS))
 
 
+def download_macro_close_panel_via_chart_api(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    close_map: dict[str, pd.Series] = {}
+    for ticker in MACRO_TICKERS:
+        try:
+            frame = download_chart_api_history(ticker, start_ts, end_ts + pd.Timedelta(days=1))
+        except Exception:
+            continue
+        if frame.empty:
+            continue
+        close_map[ticker] = frame["Close"]
+    if not close_map:
+        return pd.DataFrame(columns=list(MACRO_TICKERS))
+    panel = pd.concat(close_map, axis=1).sort_index().ffill()
+    return panel.reindex(columns=list(MACRO_TICKERS))
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
     end_ts = pd.Timestamp(end_iso)
     start_ts = end_ts - pd.DateOffset(years=MACRO_HISTORY_YEARS)
+    close_panel = pd.DataFrame(columns=list(MACRO_TICKERS))
     try:
         raw = quiet_yfinance_download(
             list(MACRO_TICKERS),
@@ -371,32 +448,36 @@ def load_macro_fear_greed_cached(end_iso: str) -> dict[str, Any]:
             auto_adjust=False,
             threads=False,
         )
+        close_panel = _extract_close_panel(raw)
     except Exception as exc:
-        score_index = pd.date_range(end=end_ts, periods=260, freq="B")
-        neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
-        return {
-            "score_series": neutral_series,
-            "benchmark_close": pd.Series(dtype=float, name="SPY"),
-            "plot_df": pd.DataFrame({"Score": neutral_series}),
-            "latest_score": 50.0,
-            "latest_label": "Neutral",
-            "latest_factors": pd.Series(dtype=float),
-            "warning": f"Fear & Greed fallback to neutral: {exc}",
-        }
+        close_panel = download_macro_close_panel_via_chart_api(start_ts, end_ts)
+        if close_panel.dropna(how="all").empty:
+            score_index = pd.date_range(end=end_ts, periods=260, freq="B")
+            neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
+            return {
+                "score_series": neutral_series,
+                "benchmark_close": pd.Series(dtype=float, name="SPY"),
+                "plot_df": pd.DataFrame({"Score": neutral_series}),
+                "latest_score": 50.0,
+                "latest_label": "Neutral",
+                "latest_factors": pd.Series(dtype=float),
+                "warning": f"Fear & Greed fallback to neutral: {exc}",
+            }
 
-    close_panel = _extract_close_panel(raw)
     if close_panel.dropna(how="all").empty:
-        score_index = pd.date_range(end=end_ts, periods=260, freq="B")
-        neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
-        return {
-            "score_series": neutral_series,
-            "benchmark_close": pd.Series(dtype=float, name="SPY"),
-            "plot_df": pd.DataFrame({"Score": neutral_series}),
-            "latest_score": 50.0,
-            "latest_label": "Neutral",
-            "latest_factors": pd.Series(dtype=float),
-            "warning": "Fear & Greed fallback to neutral: macro basket returned no usable close data",
-        }
+        close_panel = download_macro_close_panel_via_chart_api(start_ts, end_ts)
+        if close_panel.dropna(how="all").empty:
+            score_index = pd.date_range(end=end_ts, periods=260, freq="B")
+            neutral_series = pd.Series(50.0, index=score_index, name="FearGreed")
+            return {
+                "score_series": neutral_series,
+                "benchmark_close": pd.Series(dtype=float, name="SPY"),
+                "plot_df": pd.DataFrame({"Score": neutral_series}),
+                "latest_score": 50.0,
+                "latest_label": "Neutral",
+                "latest_factors": pd.Series(dtype=float),
+                "warning": "Fear & Greed fallback to neutral: macro basket returned no usable close data",
+            }
 
     score_series, latest_factors, plot_df = compute_macro_fear_greed(close_panel)
     latest_score = float(score_series.dropna().iloc[-1]) if not score_series.dropna().empty else 50.0
@@ -677,12 +758,16 @@ def compute_indicators(
     price_df: pd.DataFrame,
     macro_score_series: pd.Series | None,
     benchmark_close_series: pd.Series | None = None,
+    asset_symbol: str | None = None,
 ) -> pd.DataFrame:
     frame = normalize_ohlcv_frame(price_df)
     if frame.empty:
         return frame
 
     work = frame.copy()
+    reference_symbol = (asset_symbol or "").upper()
+    work["AssetSymbol"] = reference_symbol
+    work["ReferenceAsset"] = reference_symbol in OPTIMIZED_TICKER_SET
     work["EMA20"] = work["Close"].ewm(span=20, adjust=False, min_periods=20).mean()
     work["EMA50"] = work["Close"].ewm(span=50, adjust=False, min_periods=50).mean()
     work["EMA200"] = work["Close"].ewm(span=200, adjust=False, min_periods=200).mean()
@@ -791,6 +876,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     regime = classify_market_regime(row)
     bull_regime = _is_bull_regime(regime)
     bear_regime = _is_bear_regime(regime)
+    reference_asset = _coerce_bool(row.get("ReferenceAsset"))
 
     cycle_score = _coerce_float(row.get("CycleScore"))
     buy_setup = int(row.get("BuySetup", 0) or 0)
@@ -814,8 +900,8 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         or (mfi_change is not None and mfi_change >= 5.0)
     )
     relative_support = bool(
-        (rs_percentile is not None and rs_percentile >= 50.0)
-        or (rs_momentum is not None and rs_momentum >= -0.01)
+        (rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
+        or (rs_momentum is not None and rs_momentum >= (-0.03 if reference_asset else -0.01))
     )
 
     reversion_score = 0.0
@@ -869,7 +955,17 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif mfi <= 45:
             reversion_score += 3
 
+    if reference_asset and cycle_score is not None and rsi is not None:
+        if cycle_score <= 20 and rsi <= 45:
+            reversion_score += 12
+            reasons.append("Reference ETF washout")
+        elif cycle_score <= 30 and rsi <= 48:
+            reversion_score += 8
+            reasons.append("ETF low-zone reset")
+
     reversion_cap = 28 if regime == "Range / Transition" else 24 if bull_regime else 20
+    if reference_asset:
+        reversion_cap += 8
     score += min(reversion_cap, reversion_score)
 
     td_score = 0.0
@@ -882,6 +978,9 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     elif buy_setup >= 7:
         td_score = 10
         reasons.append(f"TD buy setup {buy_setup}")
+    elif reference_asset and buy_setup >= 5 and cycle_score is not None and cycle_score <= 35:
+        td_score = 8
+        reasons.append(f"TD early buy setup {buy_setup}")
     score += td_score
 
     context_score = 0.0
@@ -915,7 +1014,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     elif regime == "Range / Transition":
         context_score += 3
     elif not deep_reversal:
-        context_score -= 12
+        context_score -= 6 if reference_asset else 12
         reasons.append("Bear regime penalty")
 
     if bull_regime and atr_stretch is not None and atr_stretch <= -0.5 and close_value is not None and ema20 is not None and close_value >= ema20:
@@ -945,7 +1044,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         reasons.append("Price confirmation")
 
     if bear_regime and not deep_reversal:
-        score = min(score, 62.0)
+        score = min(score, 70.0 if reference_asset else 62.0)
     return max(0, min(100, int(round(score)))), reasons[:5]
 
 
@@ -955,6 +1054,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     regime = classify_market_regime(row)
     bull_regime = _is_bull_regime(regime)
     bear_regime = _is_bear_regime(regime)
+    reference_asset = _coerce_bool(row.get("ReferenceAsset"))
 
     cycle_score = _coerce_float(row.get("CycleScore"))
     sell_setup = int(row.get("SellSetup", 0) or 0)
@@ -971,6 +1071,14 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     open_value = _coerce_float(row.get("Open"))
     stop_touched = _coerce_bool(row.get("StopTouched"))
     sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
+    panic_low = bool(
+        cycle_score is not None
+        and rsi is not None
+        and (
+            (cycle_score <= 15 and rsi <= 40)
+            or (cycle_score <= 25 and rsi <= 35)
+        )
+    )
 
     exhaustion_score = 0.0
     if cycle_score is not None:
@@ -1059,7 +1167,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         distribution_score += 12
         reasons.append("Price breakdown")
     if stop_touched:
-        distribution_score += 18
+        distribution_score += 8 if reference_asset and panic_low else 18
         reasons.append("Trailing stop touched")
     if bear_regime:
         distribution_score += 12
@@ -1088,6 +1196,10 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             score -= 6
         reasons.append("Bull trend trim bias")
 
+    if reference_asset and panic_low and not sell_trigger_price:
+        score = min(score, 32.0)
+        reasons.append("Capitulation sell cap")
+
     return max(0, min(100, int(round(score)))), reasons[:5]
 
 
@@ -1097,10 +1209,12 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     regime = classify_market_regime(row)
     bull_regime = _is_bull_regime(regime)
     bear_regime = _is_bear_regime(regime)
+    reference_asset = _coerce_bool(row.get("ReferenceAsset"))
 
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
     cycle_score = _coerce_float(row.get("CycleScore"))
+    rsi = _coerce_float(row.get("RSI"))
     buy_countdown = int(row.get("BuyCountdown", 0) or 0)
     fear_greed = _coerce_float(row.get("FearGreed"))
     rs_percentile = _coerce_float(row.get("RSPercentile"))
@@ -1114,15 +1228,30 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     close_down_day = _coerce_bool(row.get("CloseDownDay"))
 
     deep_reversal = bool(cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
+    panic_low = bool(
+        cycle_score is not None
+        and rsi is not None
+        and (
+            (cycle_score <= 15 and rsi <= 40)
+            or (cycle_score <= 25 and rsi <= 35)
+        )
+    )
     volume_support = bool(
         (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
         or (mfi_change is not None and mfi_change >= 5.0)
     )
-    relative_support = bool(rs_percentile is not None and rs_percentile >= 50.0)
+    relative_support = bool(rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
     bullish_close = bool(close_value is not None and open_value is not None and close_value >= open_value)
 
-    buy_setup_threshold = preset.watch_threshold - 3 if bull_regime and relative_support else preset.watch_threshold
-    buy_setup_active = buy_score >= buy_setup_threshold and (buy_score >= sell_score - 10 or deep_reversal)
+    buy_setup_threshold = preset.watch_threshold
+    if bull_regime and relative_support:
+        buy_setup_threshold -= 3
+    if reference_asset:
+        buy_setup_threshold -= 5
+    buy_setup_active = (
+        (buy_score >= buy_setup_threshold and (buy_score >= sell_score - 10 or deep_reversal))
+        or (reference_asset and cycle_score is not None and rsi is not None and cycle_score <= 20 and rsi <= 45)
+    )
     buy_trigger = bool(
         buy_setup_active
         and not stop_close_breach
@@ -1138,11 +1267,11 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         )
     )
 
-    sell_setup_active = sell_score >= preset.watch_threshold and sell_score >= buy_score - 4
+    sell_setup_active = sell_score >= (preset.watch_threshold + (4 if reference_asset else 0)) and sell_score >= buy_score - 4 and not panic_low
     sell_trigger = bool(
         sell_setup_active
         and (
-            stop_touched
+            (stop_touched and not panic_low)
             or sell_trigger_price
             or (close_down_day and sell_score >= max(preset.watch_threshold + 6, buy_score + 8) and bear_regime)
             or (bear_regime and stop_close_breach)
@@ -1161,7 +1290,10 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     buy_strong_threshold = preset.strong_threshold - 5 if bull_regime and relative_support else preset.strong_threshold
     sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_touched else preset.strong_threshold
 
-    if sell_trigger and (stop_touched or sell_score >= max(sell_strong_threshold, buy_score + 4)):
+    if reference_asset and panic_low and buy_setup_active and not sell_trigger:
+        state = "Buy Watch"
+        key_reasons = buy_reasons
+    elif sell_trigger and (stop_touched or sell_score >= max(sell_strong_threshold, buy_score + 4)):
         state = "Strong Sell"
         key_reasons = sell_reasons
     elif buy_trigger and buy_score >= max(preset.watch_threshold, buy_strong_threshold) and buy_score >= sell_score - 5:
@@ -1239,6 +1371,8 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
     setup_window = max(3, min(6, preset.cooldown_bars + 1))
     state_frame["BuySetupWindow"] = state_frame["BuySetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
     state_frame["SellSetupWindow"] = state_frame["SellSetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
+    state_frame["BuySetupPeakScore"] = state_frame["BuyScore"].where(state_frame["BuySetupActive"]).rolling(setup_window, min_periods=1).max()
+    state_frame["SellSetupPeakScore"] = state_frame["SellScore"].where(state_frame["SellSetupActive"]).rolling(setup_window, min_periods=1).max()
 
     updated_buy_trigger: list[bool] = []
     updated_sell_trigger: list[bool] = []
@@ -1251,6 +1385,7 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         regime = str(row.get("Regime", "Range / Transition"))
         bull_regime = _is_bull_regime(regime)
         bear_regime = _is_bear_regime(regime)
+        reference_asset = _coerce_bool(row.get("ReferenceAsset"))
         buy_trigger = _coerce_bool(row.get("BuyTrigger", False))
         sell_trigger = _coerce_bool(row.get("SellTrigger", False))
         buy_window = _coerce_bool(row.get("BuySetupWindow", False))
@@ -1258,40 +1393,79 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
         close_up_day = _coerce_bool(row.get("CloseUpDay", False))
         close_down_day = _coerce_bool(row.get("CloseDownDay", False))
         stop_touched = _coerce_bool(row.get("StopTouched", False))
+        cycle_score = _coerce_float(row.get("CycleScore"))
+        rsi = _coerce_float(row.get("RSI"))
+        atr_stretch = _coerce_float(row.get("ATRStretch"))
+        panic_low = bool(
+            cycle_score is not None
+            and rsi is not None
+            and (
+                (cycle_score <= 15 and rsi <= 40)
+                or (cycle_score <= 25 and rsi <= 35)
+            )
+        )
         volume_ratio = _coerce_float(row.get("VolumeRatio20"))
         mfi_change = _coerce_float(row.get("MFIChange5"))
         rs_percentile = _coerce_float(row.get("RSPercentile"))
+        buy_peak_score = _coerce_float(row.get("BuySetupPeakScore")) or 0.0
+        sell_peak_score = _coerce_float(row.get("SellSetupPeakScore")) or 0.0
         buy_flow_support = bool(
             (volume_ratio is not None and volume_ratio >= 1.02)
             or (mfi_change is not None and mfi_change >= 2.0)
-            or (rs_percentile is not None and rs_percentile >= 45.0)
+            or (rs_percentile is not None and rs_percentile >= (42.0 if reference_asset else 45.0))
         )
         sell_flow_support = bool(
             (volume_ratio is not None and volume_ratio >= 1.02)
             or (mfi_change is not None and mfi_change <= -2.0)
             or (rs_percentile is not None and rs_percentile <= 40.0)
         )
+        reversal_zone = bool(
+            panic_low
+            or (cycle_score is not None and cycle_score <= 35)
+            or buy_score >= preset.watch_threshold
+        )
+        reversal_confirmation = bool(
+            _coerce_bool(row.get("BuyTriggerPrice", False))
+            or (close_up_day and buy_flow_support and reversal_zone)
+            or (reference_asset and close_up_day and reversal_zone and buy_peak_score >= preset.watch_threshold - 6)
+        )
+        breakdown_confirmation = bool(
+            _coerce_bool(row.get("SellTriggerPrice", False))
+            or (close_down_day and sell_flow_support)
+        )
 
-        if not buy_trigger and buy_window and close_up_day and buy_score >= max(preset.watch_threshold + 2, sell_score + 2):
-            if buy_flow_support or bull_regime or buy_score >= preset.strong_threshold - 4 or _coerce_bool(row.get("BuyTriggerPrice", False)):
+        if not buy_trigger and buy_window and reversal_confirmation and reversal_zone:
+            if (
+                buy_peak_score >= preset.watch_threshold - (6 if reference_asset else 2)
+                and sell_score <= max(buy_peak_score + 8, preset.strong_threshold + 2)
+                and not (bear_regime and breakdown_confirmation and not panic_low)
+            ):
                 buy_trigger = True
-        if not sell_trigger and sell_window and close_down_day and sell_score >= max(preset.watch_threshold + 4, buy_score + 6):
-            if sell_flow_support and (bear_regime or stop_touched or _coerce_bool(row.get("SellTriggerPrice", False))):
-                sell_trigger = True
+        if not sell_trigger and sell_window and breakdown_confirmation and not panic_low:
+            if sell_peak_score >= preset.watch_threshold + (6 if reference_asset else 4):
+                if sell_flow_support and (bear_regime or stop_touched or _coerce_bool(row.get("SellTriggerPrice", False))):
+                    sell_trigger = True
+        if reference_asset and panic_low and buy_window and reversal_confirmation and buy_peak_score >= preset.watch_threshold - 8:
+            buy_trigger = True
+            sell_trigger = False
 
-        buy_strong_threshold = preset.strong_threshold - 5 if bull_regime else preset.strong_threshold
-        sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_touched else preset.strong_threshold
-        if sell_trigger and (stop_touched or sell_score >= max(sell_strong_threshold, buy_score + 4)):
+        buy_strong_threshold = preset.strong_threshold - (8 if reference_asset else 5) if bull_regime else preset.strong_threshold - (4 if reference_asset else 0)
+        sell_strong_threshold = preset.strong_threshold + 10 if bull_regime and not stop_touched else preset.strong_threshold
+        if reference_asset and panic_low and (buy_trigger or buy_window):
+            state = "Strong Buy" if buy_peak_score >= preset.strong_threshold - 6 and reversal_confirmation else "Buy Watch"
+        elif sell_trigger and (stop_touched or sell_peak_score >= max(sell_strong_threshold, buy_score + 10)):
             state = "Strong Sell"
-        elif buy_trigger and buy_score >= max(preset.watch_threshold, buy_strong_threshold) and buy_score >= sell_score - 5:
+        elif buy_trigger and buy_peak_score >= max(preset.watch_threshold, buy_strong_threshold) and sell_score <= buy_peak_score + 8:
             state = "Strong Buy"
-        elif buy_window and buy_score >= preset.watch_threshold - 6 and buy_score >= sell_score - 12:
+        elif buy_window and buy_peak_score >= preset.watch_threshold - (8 if reference_asset else 6) and sell_score <= buy_peak_score + 12:
             state = "Buy Watch"
-        elif sell_window and sell_score >= preset.watch_threshold - 3 and sell_score > buy_score + 2:
+        elif sell_window and not panic_low and sell_peak_score >= preset.watch_threshold + (2 if reference_asset else -3) and sell_score > buy_score + (4 if reference_asset else 2):
             state = "Trim"
         else:
             state = "Hold / Neutral"
 
+        row["BuySetupPeakScore"] = buy_peak_score
+        row["SellSetupPeakScore"] = sell_peak_score
         row["BuyTrigger"] = buy_trigger
         row["SellTrigger"] = sell_trigger
         updated_buy_trigger.append(buy_trigger)
@@ -2153,6 +2327,7 @@ def main() -> None:
                 price_frame,
                 macro_data["score_series"],
                 macro_data.get("benchmark_close"),
+                payload["resolved_symbol"],
             )
             state_frame = build_state_frame(indicators, preset)
             if state_frame.empty:
@@ -2180,12 +2355,12 @@ def main() -> None:
     selected_ticker = st.selectbox("Drill-down ticker", options=ticker_options, index=0)
     selected_snapshot = next(snapshot for snapshot in snapshots if snapshot.ticker == selected_ticker)
     selected_state_frame = state_frames[selected_ticker]
-    chart_started_at = time.perf_counter()
-    chart_signal_frame = build_chart_signal_frame(selected_state_frame, preset)
-    add_timing("chart_signals", selected_ticker, chart_started_at, len(chart_signal_frame))
     replay_started_at = time.perf_counter()
     event_frame, trade_frame, replay_summary = build_trade_replay_from_state_frame(selected_ticker, selected_state_frame, preset)
     add_timing("replay", selected_ticker, replay_started_at, len(event_frame))
+    chart_started_at = time.perf_counter()
+    chart_signal_frame = event_frame.loc[event_frame["Signal"].isin(["BUY", "SELL"])].copy() if not event_frame.empty else build_chart_signal_frame(selected_state_frame, preset)
+    add_timing("chart_signals", selected_ticker, chart_started_at, len(chart_signal_frame))
     add_timing("total", "app_run", run_started_at)
     performance_frame = build_performance_frame(timing_rows)
     render_ticker_panel(
