@@ -8,3 +8,4 @@ requests>=2.31,<3
 yfinance>=0.2,<2
 lxml>=5,<7
 pytest>=9,<10
+statsmodels
