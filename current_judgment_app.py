@@ -223,6 +223,23 @@ SELL_CUTOFFS: dict[str, float] = {
     "bb_extreme": 0.90,
 }
 
+DEEP_VALUE_CYCLE_THRESHOLD = 25.0
+DEEP_VALUE_EXTREME_CYCLE_THRESHOLD = 18.0
+DEEP_VALUE_RSI_THRESHOLD = 42.0
+DEEP_VALUE_EXTREME_RSI_THRESHOLD = 38.0
+DEEP_VALUE_SETUP_THRESHOLD = 8
+DEEP_VALUE_EXTREME_SETUP_THRESHOLD = 9
+HEAT_TRIM_FEAR_THRESHOLD = 60.0
+HEAT_TRIM_EXTREME_FEAR_THRESHOLD = 70.0
+HEAT_TRIM_RSI_THRESHOLD = 66.0
+HEAT_TRIM_EXTREME_RSI_THRESHOLD = 72.0
+HEAT_TRIM_SETUP_THRESHOLD = 8
+HEAT_TRIM_EXTREME_SETUP_THRESHOLD = 9
+HEAT_TRIM_REDUCE_WEIGHT = 0.25
+HEAT_TRIM_COOLDOWN_BARS = 20
+LOW_CONFLUENCE_SCALE_IN_WEIGHT = 0.25
+LOW_CONFLUENCE_SCALE_IN_COOLDOWN_BARS = 5
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -2047,6 +2064,29 @@ def build_ml_walkforward_bundle(
     final_oos = final_state.loc[oos_start:].copy()
     rule_summary = build_trade_replay_from_state_frame(symbol, baseline_oos, preset)[2]
     ml_summary = build_trade_replay_from_state_frame(symbol, final_oos, preset)[2]
+    rule_total_return = rule_summary.get("strategy_total_return")
+    ml_total_return = ml_summary.get("strategy_total_return")
+    if (
+        rule_total_return is not None
+        and ml_total_return is not None
+        and float(ml_total_return) <= float(rule_total_return)
+    ):
+        fallback_state = attach_rule_only_columns(baseline_state_frame.copy())
+        return {
+            "enabled": False,
+            "model_mode": "rules_only",
+            "reason": "Rule-only outperformed walk-forward ML; keeping rule strategy",
+            "state_frame": fallback_state,
+            "comparison": {
+                "rule_summary": rule_summary,
+                "ml_summary": ml_summary,
+                "buy_threshold": final_thresholds.buy_threshold,
+                "sell_threshold": final_thresholds.sell_threshold,
+                "sell_veto_profile": final_thresholds.sell_veto_profile,
+            },
+            "selection_frame": pd.DataFrame(selection_rows),
+            "oos_start": oos_start,
+        }
     return {
         "enabled": True,
         "model_mode": final_model_mode,
@@ -2170,6 +2210,102 @@ def _is_bear_regime(regime: str) -> bool:
     return regime in {"Bear Trend", "Bear Rally"}
 
 
+def detect_deep_value_confluence(row: Any) -> tuple[bool, bool]:
+    cycle_score = _coerce_float(row_get(row, "CycleScore"))
+    rsi = _coerce_float(row_get(row, "RSI"))
+    buy_setup = int(row_get(row, "BuySetup", 0) or 0)
+    buy_countdown = int(row_get(row, "BuyCountdown", 0) or 0)
+    close_value = _coerce_float(row_get(row, "Close"))
+    ema20 = _coerce_float(row_get(row, "EMA20"))
+    ema50 = _coerce_float(row_get(row, "EMA50"))
+    close_up_day = _coerce_bool(row_get(row, "CloseUpDay", False))
+
+    base_overlap = bool(
+        cycle_score is not None
+        and cycle_score <= DEEP_VALUE_CYCLE_THRESHOLD
+        and rsi is not None
+        and rsi <= DEEP_VALUE_RSI_THRESHOLD
+        and (buy_countdown == 13 or buy_setup >= DEEP_VALUE_SETUP_THRESHOLD)
+    )
+    ma_context = bool(
+        close_up_day
+        or (
+            close_value is not None
+            and ema20 is not None
+            and close_value <= (ema20 * 1.02)
+        )
+        or (
+            close_value is not None
+            and ema50 is not None
+            and close_value >= (ema50 * 0.98)
+        )
+    )
+    extreme_overlap = bool(
+        cycle_score is not None
+        and cycle_score <= DEEP_VALUE_EXTREME_CYCLE_THRESHOLD
+        and rsi is not None
+        and rsi <= DEEP_VALUE_EXTREME_RSI_THRESHOLD
+        and (
+            buy_countdown == 13
+            or buy_setup >= DEEP_VALUE_EXTREME_SETUP_THRESHOLD
+            or close_up_day
+        )
+    )
+    return base_overlap and ma_context, extreme_overlap
+
+
+def detect_heat_trim_confluence(row: Any) -> tuple[bool, bool]:
+    cycle_score = _coerce_float(row_get(row, "CycleScore"))
+    rsi = _coerce_float(row_get(row, "RSI"))
+    fear_greed = _coerce_float(row_get(row, "FearGreed"))
+    sell_setup = int(row_get(row, "SellSetup", 0) or 0)
+    sell_countdown = int(row_get(row, "SellCountdown", 0) or 0)
+    close_value = _coerce_float(row_get(row, "Close"))
+    ema20 = _coerce_float(row_get(row, "EMA20"))
+    ema50 = _coerce_float(row_get(row, "EMA50"))
+
+    ma_context = bool(
+        close_value is not None
+        and ema20 is not None
+        and ema50 is not None
+        and close_value >= ema20
+        and ema20 >= ema50
+    )
+    base_overlap = bool(
+        fear_greed is not None
+        and fear_greed >= HEAT_TRIM_FEAR_THRESHOLD
+        and rsi is not None
+        and rsi >= HEAT_TRIM_RSI_THRESHOLD
+        and (
+            sell_countdown == 13
+            or sell_setup >= HEAT_TRIM_SETUP_THRESHOLD
+            or (cycle_score is not None and cycle_score >= 72.0)
+        )
+    )
+    extreme_overlap = bool(
+        fear_greed is not None
+        and fear_greed >= HEAT_TRIM_EXTREME_FEAR_THRESHOLD
+        and rsi is not None
+        and rsi >= HEAT_TRIM_EXTREME_RSI_THRESHOLD
+        and (
+            sell_countdown == 13
+            or sell_setup >= HEAT_TRIM_EXTREME_SETUP_THRESHOLD
+            or (cycle_score is not None and cycle_score >= 80.0)
+        )
+    )
+    return base_overlap and ma_context, extreme_overlap and ma_context
+
+
+def detect_macro_trend_exit(row: Any) -> bool:
+    fear_greed = _coerce_float(row_get(row, "FearGreed"))
+    macd_bear_cross = _coerce_bool(row_get(row, "MACDBearCross", False))
+    return bool(
+        macd_bear_cross
+        and fear_greed is not None
+        and fear_greed < BUY_CUTOFFS["fear_reset"]
+    )
+
+
 def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     score = 0.0
     reasons: list[str] = []
@@ -2204,6 +2340,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
     ema20 = _coerce_float(row.get("EMA20"))
+    deep_value_confluence, deep_value_extreme = detect_deep_value_confluence(row)
     buy_rsi_reset = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
     buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
     buy_mfi_reset = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
@@ -2316,6 +2453,10 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
         elif cycle_score <= 30 and rsi <= 48:
             reversion_score += 8
             reasons.append("ETF low-zone reset")
+
+    if deep_value_confluence:
+        reversion_score += 12 if deep_value_extreme else 8
+        reasons.append("STL+TD+RSI washout")
 
     reversion_cap = 28 if regime == "Range / Transition" else 24 if bull_regime else 20
     if reference_asset:
@@ -2437,6 +2578,7 @@ def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
             bool(buy_cutoff_hits >= 2 or buy_fear_reset),
             bull_regime,
             macd_bull_cross,
+            deep_value_confluence,
         ]
     ))
     if confluence_count >= 3:
@@ -2491,9 +2633,19 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
     volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
     close_value = _coerce_float(row.get("Close"))
     open_value = _coerce_float(row.get("Open"))
+    ema20 = _coerce_float(row.get("EMA20"))
+    ema50 = _coerce_float(row.get("EMA50"))
     stop_touched = _coerce_bool(row.get("StopTouched"))
     stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
     sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
+    heat_trim_confluence, heat_trim_extreme = detect_heat_trim_confluence(row)
+    ma_overheat = bool(
+        close_value is not None
+        and ema20 is not None
+        and ema50 is not None
+        and close_value >= ema20
+        and ema20 >= ema50
+    )
     sell_rsi_hot = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_hot"])
     sell_rsi_extreme = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_extreme"])
     sell_mfi_hot = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_hot"])
@@ -2568,31 +2720,36 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             heat_score += 4
 
     if sell_rsi_extreme:
-        heat_score += 10
+        heat_score += 10 if (ma_overheat or bear_regime) else 5
         heat_signal = True
         reasons.append("RSI overheated")
     elif sell_rsi_hot:
-        heat_score += 6
+        heat_score += 6 if (ma_overheat or bear_regime) else 3
         heat_signal = True
         reasons.append("RSI hot")
 
     if sell_mfi_extreme:
-        heat_score += 8
+        heat_score += 8 if (ma_overheat or bear_regime) else 4
         heat_signal = True
         reasons.append("MFI euphoric")
     elif sell_mfi_hot:
-        heat_score += 4
+        heat_score += 4 if (ma_overheat or bear_regime) else 2
         heat_signal = True
         reasons.append("MFI rich")
 
     if sell_bb_extreme:
-        heat_score += 8
+        heat_score += 8 if (ma_overheat or bear_regime) else 4
         heat_signal = True
         reasons.append("Bollinger upper-tag")
     elif sell_bb_hot:
-        heat_score += 4
+        heat_score += 4 if (ma_overheat or bear_regime) else 2
         heat_signal = True
         reasons.append("Bollinger hot-zone")
+
+    if heat_trim_confluence:
+        heat_score += 8 if heat_trim_extreme else 5
+        heat_signal = True
+        reasons.append("Fear/RSI/MA trim cluster")
 
     heat_score = min(18.0, heat_score)
     score += weighted_component(heat_score, SELL_COMPONENT_WEIGHTS["heat"])
@@ -2616,10 +2773,10 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
         distribution_score += 6
         reasons.append("Blowoff volume")
     if sell_greed_extreme:
-        distribution_score += 8
+        distribution_score += 8 if (ma_overheat or bear_regime) else 3
         reasons.append("Macro greed risk")
     elif sell_greed_hot:
-        distribution_score += 4
+        distribution_score += 4 if (ma_overheat or bear_regime) else 1
         reasons.append("Macro greed warning")
     if tips_risk_off:
         if tips_momentum is not None and tips_momentum <= -0.03:
@@ -2682,6 +2839,7 @@ def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
             stop_close_breach,
             bear_regime,
             macd_bear_cross or sell_cutoff_hits >= 2,
+            heat_trim_confluence,
         ]
     ))
     if confluence_count >= 3:
@@ -2765,6 +2923,9 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
     sell_bb_extreme = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_extreme"])
     sell_cutoff_hits = int(sum([sell_rsi_cutoff, sell_mfi_cutoff, sell_greed_cutoff, sell_bb_cutoff]))
     sell_extreme_hits = int(sum([sell_rsi_extreme, sell_mfi_extreme, sell_greed_extreme, sell_bb_extreme]))
+    deep_value_confluence, deep_value_extreme = detect_deep_value_confluence(row)
+    heat_trim_confluence, heat_trim_extreme = detect_heat_trim_confluence(row)
+    macro_trend_exit = detect_macro_trend_exit(row)
 
     deep_reversal = bool(cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
     panic_low = bool(
@@ -2838,9 +2999,11 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
             and (volume_support or macd_bull_cross or bull_regime)
         )
         or strong_trend_dip
+        or deep_value_confluence
     )
     sell_capitulation_block = bool(
         deep_reversal
+        or deep_value_extreme
         or buy_extreme_hits >= 2
         or (cycle_score is not None and cycle_score <= 30 and buy_cutoff_hits >= 2)
     )
@@ -2871,6 +3034,8 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         buy_setup_threshold -= 5
     if buy_cutoff_hits >= 2 or deep_reversal:
         buy_setup_threshold -= 2
+    if deep_value_confluence:
+        buy_setup_threshold -= 4
     if tips_risk_off and not deep_reversal:
         buy_setup_threshold += 2
     if chop_zone and not (macd_bull_cross or accumulation_flow or deep_reversal):
@@ -2931,6 +3096,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
                 )
             )
             or (bull_regime and buy_score >= max(preset.watch_threshold, preset.strong_threshold - 8) and bullish_close and volume_support and not flow_conflict)
+            or (deep_value_confluence and (buy_trigger_price or macd_bull_cross or close_up_day))
         )
     )
     sell_trigger = bool(
@@ -2958,6 +3124,7 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
             bull_regime
             or (rs_percentile is not None and rs_percentile >= 50.0)
             or sell_greed_cutoff
+            or heat_trim_confluence
         )
     )
 
@@ -2997,6 +3164,11 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         state = "Hold / Neutral"
         key_reasons = buy_reasons[:2] + sell_reasons[:2]
 
+    if bull_regime and heat_trim_confluence and not macro_trend_exit and state in {"Strong Sell", "Sell"}:
+        state = "Weak Sell"
+        sell_trigger = False
+        key_reasons = sell_reasons
+
     td_label = str(row.get("TDLabel", "Unavailable"))
     cycle_text = f"Cycle {_format_float(cycle_score, 1)}" if cycle_score is not None else "Cycle n/a"
     fear_text = f"Fear & Greed {_format_float(fear_greed, 0)}" if fear_greed is not None else "Fear & Greed n/a"
@@ -3022,6 +3194,11 @@ def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
         "SignalNote": note,
         "BuyReasonText": " | ".join(buy_reasons),
         "SellReasonText": " | ".join(sell_reasons),
+        "DeepValueConfluence": deep_value_confluence,
+        "DeepValueExtreme": deep_value_extreme,
+        "HeatTrimConfluence": heat_trim_confluence,
+        "HeatTrimExtreme": heat_trim_extreme,
+        "MacroTrendExit": macro_trend_exit,
     }
 
 
@@ -3490,6 +3667,7 @@ def build_trade_replay_from_state_frame(
     last_buy_index = -10_000
     last_sell_index = -10_000
     last_partial_index = -10_000
+    last_scale_index = -10_000
     entry_index = -10_000
     min_hold_bars = preset_min_hold_bars(preset)
     partial_hold_bars = max(1, min_hold_bars - 1)
@@ -3514,6 +3692,19 @@ def build_trade_replay_from_state_frame(
         atr_value = _coerce_float(getattr(row, "ATR", np.nan))
         buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", state in {"Buy", "Strong Buy"}))
         sell_setup_active = _coerce_bool(getattr(row, "SellSetupActive", state_sell_side))
+        regime = str(getattr(row, "Regime", "") or "")
+        regime_known = bool(regime)
+        bull_regime = regime in ML_BULL_REGIMES
+        close_up_day = _coerce_bool(getattr(row, "CloseUpDay", False))
+        deep_value_confluence = _coerce_bool(getattr(row, "DeepValueConfluence", False))
+        heat_trim_confluence = _coerce_bool(getattr(row, "HeatTrimConfluence", False))
+        macro_trend_exit = _coerce_bool(getattr(row, "MacroTrendExit", False))
+        if regime_known and not deep_value_confluence:
+            deep_value_confluence, _ = detect_deep_value_confluence(TupleRowAccessor(row))
+        if regime_known and not heat_trim_confluence:
+            heat_trim_confluence, _ = detect_heat_trim_confluence(TupleRowAccessor(row))
+        if regime_known and not macro_trend_exit:
+            macro_trend_exit = detect_macro_trend_exit(TupleRowAccessor(row))
         hold_bars_elapsed = position - entry_index if in_position else 10_000
         hold_lock_active = in_position and hold_bars_elapsed < min_hold_bars
         stop_exit_confirmed = _coerce_bool(getattr(row, "StopExitConfirmed", False))
@@ -3535,27 +3726,42 @@ def build_trade_replay_from_state_frame(
             or (stop_exit_confirmed and state_sell_side)
         )
         force_exit = bool(
-            stop_emergency_exit
+            (not regime_known and stop_emergency_exit)
             or (
-                state == "Strong Sell"
+                not regime_known
+                and state == "Strong Sell"
                 and sell_score >= max(preset.strong_threshold + 8, buy_score + 10)
             )
         )
 
         buy_ready = (not in_position) and buy_trigger and (position - last_buy_index) >= preset.cooldown_bars
+        scale_in_ready = (
+            in_position
+            and position_remaining < 1.0
+            and deep_value_confluence
+            and (buy_trigger or close_up_day)
+            and (position - last_scale_index) >= LOW_CONFLUENCE_SCALE_IN_COOLDOWN_BARS
+        )
         partial_ready = (
             in_position
-            and (not partial_taken)
-            and state == "Weak Sell"
-            and sell_setup_active
-            and not stop_exit_confirmed
+            and position_remaining > (1.0 - HEAT_TRIM_REDUCE_WEIGHT)
+            and (
+                heat_trim_confluence
+                or (
+                    not regime_known
+                    and (not partial_taken)
+                    and state == "Weak Sell"
+                    and sell_setup_active
+                    and not stop_exit_confirmed
+                )
+            )
             and (hold_bars_elapsed >= partial_hold_bars)
-            and (position - last_partial_index) >= preset.cooldown_bars
+            and (position - last_partial_index) >= HEAT_TRIM_COOLDOWN_BARS
         )
         sell_ready = (
             in_position
-            and sell_trigger
-            and ((hold_bars_elapsed >= min_hold_bars) or force_exit)
+            and (macro_trend_exit or ((not regime_known) and sell_trigger))
+            and ((hold_bars_elapsed >= min_hold_bars) or force_exit or macro_trend_exit)
             and (position - last_sell_index) >= preset.cooldown_bars
         )
 
@@ -3585,11 +3791,35 @@ def build_trade_replay_from_state_frame(
             )
             continue
 
+        if scale_in_ready and entry_price is not None and position_remaining > 0:
+            buy_weight = min(LOW_CONFLUENCE_SCALE_IN_WEIGHT, 1.0 - position_remaining)
+            if buy_weight > 0:
+                entry_price = ((entry_price * position_remaining) + (price * buy_weight)) / (position_remaining + buy_weight)
+                position_remaining += buy_weight
+                last_scale_index = position
+                events.append(
+                    {
+                        "Ticker": ticker,
+                        "Trade": trade_id,
+                        "Date": timestamp,
+                        "Signal": "SCALE IN BUY",
+                        "Price": price,
+                        "State": state,
+                        "BuyScore": buy_score,
+                        "SellScore": sell_score,
+                        "PositionAfter": position_remaining,
+                        "Reason": "Deep value confluence scale-in",
+                    }
+                )
+                continue
+
         if partial_ready and entry_price is not None and position_remaining > 0:
-            sell_weight = min(0.5, position_remaining)
+            sell_weight = max(0.0, position_remaining - (1.0 - HEAT_TRIM_REDUCE_WEIGHT))
+            if sell_weight <= 0:
+                sell_weight = min(HEAT_TRIM_REDUCE_WEIGHT, position_remaining)
             realized_return += sell_weight * (price / entry_price - 1.0)
             position_remaining -= sell_weight
-            partial_taken = position_remaining > 0
+            partial_taken = True
             last_partial_index = position
             events.append(
                 {
@@ -3602,7 +3832,7 @@ def build_trade_replay_from_state_frame(
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
                     "PositionAfter": position_remaining,
-                    "Reason": note,
+                    "Reason": "Fear/RSI/MA trim confluence" if heat_trim_confluence else note,
                 }
             )
             continue
@@ -3622,7 +3852,7 @@ def build_trade_replay_from_state_frame(
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
                     "PositionAfter": 0.0,
-                    "Reason": "Trailing stop confirmed" if (stop_exit_confirmed or stop_emergency_exit or (stop_touched and pd.notna(stop_price) and price <= stop_price)) else note,
+                    "Reason": "MACD bear + fear regime exit" if macro_trend_exit else note,
                 }
             )
             trades.append(
@@ -3646,6 +3876,7 @@ def build_trade_replay_from_state_frame(
             position_remaining = 0.0
             realized_return = 0.0
             entry_index = -10_000
+            last_scale_index = -10_000
 
     if in_position and entry_price is not None and entry_date is not None:
         last_timestamp = pd.Timestamp(state_frame.index[-1])
