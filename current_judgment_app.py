@@ -4,65 +4,54 @@ import argparse
 import contextlib
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
+import hashlib
 import io
 import json
 import logging
 import re
 import sys
 import time
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
 import streamlit as st
 from statsmodels.tsa.seasonal import STL
 import urllib3
 import yfinance as yf
 
-try:
-    from lightgbm import LGBMClassifier
 
-    LIGHTGBM_AVAILABLE = True
-except Exception:
-    LGBMClassifier = None
-    LIGHTGBM_AVAILABLE = False
-
-
-if any(flag in sys.argv for flag in ("--self-test", "--benchmark", "--ml-backtest")):
+if any(flag in sys.argv for flag in ("--self-test", "--benchmark", "--rule-backtest", "--optimize-report")):
     logging.getLogger("streamlit").setLevel(logging.ERROR)
     logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
 
 
-APP_TITLE = "Single-File Swing Trading Dashboard"
+APP_TITLE = "Rule-Only Hold-Beat Dashboard"
 CACHE_TTL_SECONDS = 3600
 MACRO_HISTORY_YEARS = 6
-OPTIMIZED_TICKERS = ("SPY", "QQQ", "069500.KS")
-OPTIMIZED_TICKER_SET = set(OPTIMIZED_TICKERS)
-DEFAULT_WATCHLIST = OPTIMIZED_TICKERS
+CORE_TICKERS = ("SPY", "QQQ", "069500.KS")
+CORE_TICKER_SET = set(CORE_TICKERS)
+DEFAULT_WATCHLIST = CORE_TICKERS
 REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 MACRO_TICKERS = ("SPY", "^VIX", "HYG", "IEF", "RSP", "XLY", "XLP", "UUP", "TIPS")
-ML_TARGET_SYMBOL = "QQQ"
-ML_FEATURE_TICKERS = ("QQQ", "SPY", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "TSLA", "DIA", "IWM", "TLT", "IEF", "HYG", "^VIX")
-ML_BATCH_TICKERS = tuple(dict.fromkeys(ML_FEATURE_TICKERS + MACRO_TICKERS))
-ML_TRANSACTION_COST = 0.001
-ML_BUY_HORIZON_BARS = 15
-ML_SELL_HOLDOUT_BARS = 5
-ML_THRESHOLD_GRID = (0.50, 0.55, 0.60, 0.65, 0.70)
-ML_CV_SPLITS = 6
-ML_CV_TEST_SIZE = 63
-ML_CV_GAP = 15
-ML_RANDOM_STATE = 42
-ML_BUY_TARGET_ATR = 1.5
-ML_BUY_STOP_ATR = 1.0
-ML_MIN_CANDIDATE_SAMPLES = 24
-ML_MACRO_FEAR_BUY_VETO = 32.0
-ML_DEFAULT_SELL_VETO_PROFILE = "none"
+VALIDATION_WINDOWS: tuple[tuple[str, int | None], ...] = (
+    ("1Y", 365),
+    ("3Y", 365 * 3),
+    ("5Y", 365 * 5),
+    ("Full", None),
+)
+OPTIMIZER_START_ISO = "2004-01-01"
+TRANSACTION_COST_PER_SIDE = 0.001
+RANDOM_STATE = 42
+EMA_FAST_OPTIONS = (5, 8, 10, 12, 20)
+EMA_SLOW_OPTIONS = (20, 30, 50, 100, 200)
+EMA_ALL_SPANS = tuple(sorted(set(EMA_FAST_OPTIONS + EMA_SLOW_OPTIONS)))
+OPTIMIZER_STATE_KEY = "rule_optimizer_state"
+DEFAULT_HISTORY_YEARS = 5
+DEFAULT_SEARCH_BUDGET = "Standard"
 KOREAN_TICKER_PATTERN = re.compile(r"^(?P<code>\d{6})(?:\.(?P<suffix>KS|KQ))?$", re.IGNORECASE)
 STATE_COLORS = {
     "Strong Buy": "#15803d",
@@ -82,6 +71,87 @@ STATE_PRIORITY = {
     "Sell": 5,
     "Strong Sell": 6,
 }
+BUY_CUTOFFS: dict[str, float] = {
+    "rsi_reset": 40.0,
+    "rsi_extreme": 32.0,
+    "mfi_reset": 35.0,
+    "mfi_extreme": 18.0,
+    "fear_reset": 40.0,
+    "fear_extreme": 25.0,
+    "bb_low": 0.22,
+}
+SELL_CUTOFFS: dict[str, float] = {
+    "rsi_hot": 66.0,
+    "rsi_extreme": 74.0,
+    "mfi_hot": 68.0,
+    "mfi_extreme": 82.0,
+    "greed_hot": 60.0,
+    "greed_extreme": 70.0,
+    "bb_high": 0.78,
+    "bb_extreme": 0.90,
+}
+SEARCH_BUDGET_SPECS: dict[str, dict[str, Any]] = {
+    "Quick": {
+        "coarse_fast": (8,),
+        "coarse_slow": (20, 50),
+        "buy_thresholds": (58,),
+        "sell_thresholds": (56,),
+        "buy_votes": (2,),
+        "sell_votes": (2,),
+        "bottom_votes": (2,),
+        "toggle_options": (
+            (False, False, True),
+            (True, False, True),
+        ),
+        "batch_size": 4,
+        "local_top_n": 1,
+        "local_limit": 12,
+    },
+    "Standard": {
+        "coarse_fast": EMA_FAST_OPTIONS,
+        "coarse_slow": EMA_SLOW_OPTIONS,
+        "buy_thresholds": (52, 58, 64, 70),
+        "sell_thresholds": (50, 56, 62, 68),
+        "buy_votes": (1, 2, 3),
+        "sell_votes": (1, 2, 3),
+        "bottom_votes": (2, 3),
+        "toggle_options": (
+            (False, False, False),
+            (False, False, True),
+            (True, False, True),
+            (False, True, True),
+            (True, True, True),
+            (True, True, False),
+        ),
+        "batch_size": 24,
+        "local_top_n": 5,
+        "local_limit": 360,
+    },
+    "Exhaustive": {
+        "coarse_fast": EMA_FAST_OPTIONS,
+        "coarse_slow": EMA_SLOW_OPTIONS,
+        "buy_thresholds": (50, 54, 58, 62, 66, 70),
+        "sell_thresholds": (48, 52, 56, 60, 64, 68),
+        "buy_votes": (1, 2, 3),
+        "sell_votes": (1, 2, 3),
+        "bottom_votes": (2, 3),
+        "toggle_options": (
+            (False, False, False),
+            (False, False, True),
+            (True, False, False),
+            (True, False, True),
+            (False, True, False),
+            (False, True, True),
+            (True, True, False),
+            (True, True, True),
+        ),
+        "batch_size": 36,
+        "local_top_n": 8,
+        "local_limit": None,
+    },
+}
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 @dataclass(frozen=True)
@@ -113,66 +183,72 @@ class TickerSnapshot:
 
 
 @dataclass(frozen=True)
-class ReplayEvent:
+class RuleStrategyConfig:
+    fast_ema: int
+    slow_ema: int
+    bottom_required: int
+    buy_confirmation_required: int
+    sell_confirmation_required: int
+    buy_score_threshold: int
+    sell_score_threshold: int
+    require_macd_for_buy: bool
+    require_volume_for_buy: bool
+    allow_reclaim_trigger: bool
+
+    def config_hash(self) -> str:
+        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class ValidationRow:
     ticker: str
-    trade: int
-    date: pd.Timestamp
-    signal: str
-    price: float
-    state: str
-    buy_score: int
-    sell_score: int
-    position_after: float
-    reason: str
+    window: str
+    start_date: str
+    end_date: str
+    strategy_total_return: float | None
+    buy_hold_return: float | None
+    excess_return: float | None
+    max_drawdown: float | None
+    buy_hold_max_drawdown: float | None
+    cagr: float | None
+    buy_hold_cagr: float | None
+    win_rate: float | None
+    closed_trades: int
+    pass_case: bool
+    fail_reason: str | None
 
 
 @dataclass(frozen=True)
-class ReplayTrade:
-    ticker: str
-    trade: int
-    status: str
-    entry_date: pd.Timestamp
-    exit_date: pd.Timestamp
-    entry_price: float
-    exit_price: float
-    total_return: float
-    hold_days: int
-    partial_scaled_out: str
+class OptimizerEvaluation:
+    config: RuleStrategyConfig
+    config_hash: str
+    validation_rows: tuple[ValidationRow, ...]
+    passed: bool
+    best_so_far_summary: dict[str, Any]
+    resume_cursor: int
+    min_excess_return: float
+    average_excess_return: float
+    average_drawdown_advantage: float
+    average_win_rate: float
+    failing_cases: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class MLThresholdSelection:
-    buy_threshold: float
-    sell_threshold: float
-    sell_veto_profile: str
-    summary: dict[str, float | int | None]
-
-
-@dataclass(frozen=True)
-class MLSellVetoProfile:
-    name: str
-    bull_only: bool = False
-    max_cycle_score: float | None = None
-    max_sell_score: float | None = None
-    min_rs_percentile: float | None = None
-    max_fear_greed: float | None = None
-
-
-@dataclass(frozen=True)
-class ModelDescriptor:
-    name: str
-    estimator_name: str
-
-
-ML_BULL_REGIMES = frozenset({"Bull Trend", "Bull Pullback"})
-ML_SELL_VETO_PROFILES = (
-    MLSellVetoProfile(name=ML_DEFAULT_SELL_VETO_PROFILE),
-    MLSellVetoProfile(name="bull_cycle55", bull_only=True, max_cycle_score=55.0),
-)
-ML_SELL_VETO_PROFILE_MAP = {profile.name: profile for profile in ML_SELL_VETO_PROFILES}
-ML_ACTIVE_SELL_VETO_PROFILES = tuple(
-    profile for profile in ML_SELL_VETO_PROFILES if profile.name != ML_DEFAULT_SELL_VETO_PROFILE
-)
+@dataclass
+class RuleOptimizerState:
+    budget_name: str
+    stage: str
+    resume_cursor: int
+    coarse_candidates: list[RuleStrategyConfig]
+    local_candidates: list[RuleStrategyConfig]
+    top_results: list[OptimizerEvaluation]
+    best_result: OptimizerEvaluation | None
+    best_so_far_summary: dict[str, Any]
+    evaluated_candidates: int
+    total_candidates: int
+    completed: bool
+    last_message: str
+    last_updated: str
 
 
 PROFILE_PRESETS = {
@@ -181,66 +257,18 @@ PROFILE_PRESETS = {
     "Conservative": SignalPreset(name="Conservative", strong_threshold=74, watch_threshold=60, cooldown_bars=6),
 }
 DEFAULT_SIGNAL_PRESET = PROFILE_PRESETS["Balanced"]
-
-BUY_COMPONENT_WEIGHTS: dict[str, float] = {
-    "reversion": 1.00,
-    "td": 1.00,
-    "macro": 1.00,
-    "relative": 1.00,
-    "volume": 1.00,
-    "macd": 1.00,
-    "regime": 1.00,
-    "confluence": 1.00,
-    "confirmation": 1.00,
-}
-
-SELL_COMPONENT_WEIGHTS: dict[str, float] = {
-    "exhaustion": 1.00,
-    "td": 1.00,
-    "heat": 1.00,
-    "distribution": 1.00,
-    "confluence": 1.00,
-}
-
-BUY_CUTOFFS: dict[str, float] = {
-    "rsi_reset": 40.0,
-    "rsi_extreme": 32.0,
-    "mfi_reset": 35.0,
-    "mfi_extreme": 18.0,
-    "fear_reset": 40.0,
-    "fear_extreme": 25.0,
-    "bb_low": 0.22,
-}
-
-SELL_CUTOFFS: dict[str, float] = {
-    "rsi_hot": 66.0,
-    "rsi_extreme": 74.0,
-    "mfi_hot": 68.0,
-    "mfi_extreme": 82.0,
-    "greed_hot": 60.0,
-    "greed_extreme": 70.0,
-    "bb_high": 0.78,
-    "bb_extreme": 0.90,
-}
-
-DEEP_VALUE_CYCLE_THRESHOLD = 25.0
-DEEP_VALUE_EXTREME_CYCLE_THRESHOLD = 18.0
-DEEP_VALUE_RSI_THRESHOLD = 42.0
-DEEP_VALUE_EXTREME_RSI_THRESHOLD = 38.0
-DEEP_VALUE_SETUP_THRESHOLD = 8
-DEEP_VALUE_EXTREME_SETUP_THRESHOLD = 9
-HEAT_TRIM_FEAR_THRESHOLD = 60.0
-HEAT_TRIM_EXTREME_FEAR_THRESHOLD = 70.0
-HEAT_TRIM_RSI_THRESHOLD = 66.0
-HEAT_TRIM_EXTREME_RSI_THRESHOLD = 72.0
-HEAT_TRIM_SETUP_THRESHOLD = 8
-HEAT_TRIM_EXTREME_SETUP_THRESHOLD = 9
-HEAT_TRIM_REDUCE_WEIGHT = 0.25
-HEAT_TRIM_COOLDOWN_BARS = 20
-LOW_CONFLUENCE_SCALE_IN_WEIGHT = 0.25
-LOW_CONFLUENCE_SCALE_IN_COOLDOWN_BARS = 5
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+DEFAULT_RULE_CONFIG = RuleStrategyConfig(
+    fast_ema=8,
+    slow_ema=50,
+    bottom_required=2,
+    buy_confirmation_required=2,
+    sell_confirmation_required=2,
+    buy_score_threshold=58,
+    sell_score_threshold=56,
+    require_macd_for_buy=False,
+    require_volume_for_buy=False,
+    allow_reclaim_trigger=True,
+)
 
 
 def preset_min_hold_bars(preset: SignalPreset) -> int:
@@ -262,7 +290,7 @@ def apply_style() -> None:
         .hero {
             padding: 1.35rem 1.5rem;
             border-radius: 18px;
-            background: linear-gradient(135deg, #0f172a 0%, #14532d 40%, #f5efe6 100%);
+            background: linear-gradient(135deg, #0f172a 0%, #14532d 42%, #f5efe6 100%);
             color: #f8fafc;
             margin-bottom: 1rem;
         }
@@ -273,47 +301,40 @@ def apply_style() -> None:
         }
         .hero p {
             margin: 0.55rem 0 0;
-            color: rgba(248, 250, 252, 0.9);
+            color: rgba(248, 250, 252, 0.92);
         }
         .metric-card {
-            padding: 1rem 1.05rem;
+            border: 1px solid rgba(15, 23, 42, 0.08);
             border-radius: 16px;
-            background: #f8fafc;
-            border: 1px solid rgba(148, 163, 184, 0.24);
-            min-height: 108px;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            padding: 0.9rem 1rem;
+            min-height: 118px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
         }
         .metric-card .eyebrow {
-            font-size: 0.8rem;
-            color: #475569;
+            font-size: 0.78rem;
+            letter-spacing: 0.04em;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            color: #475569;
+            margin-bottom: 0.35rem;
         }
         .metric-card .value {
-            font-size: 1.65rem;
+            font-size: 1.55rem;
             font-weight: 700;
             color: #0f172a;
-            margin-top: 0.22rem;
+            line-height: 1.1;
+            margin-bottom: 0.35rem;
         }
         .metric-card .caption {
-            margin-top: 0.24rem;
+            font-size: 0.84rem;
             color: #475569;
-            font-size: 0.92rem;
         }
         .section-label {
-            margin-top: 0.35rem;
-            color: #0f172a;
-            font-weight: 700;
-            font-size: 1.12rem;
-        }
-        .pill {
-            display: inline-block;
-            padding: 0.34rem 0.65rem;
-            margin: 0.14rem 0.24rem 0.14rem 0;
-            border-radius: 999px;
-            background: #e2e8f0;
-            color: #0f172a;
-            font-size: 0.88rem;
-            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #475569;
+            margin: 1.15rem 0 0.55rem;
         }
         </style>
         """,
@@ -374,7 +395,8 @@ class StreamlitProgressTracker:
     def fail(self, detail: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         self.logs.append(f"[{timestamp}] Failed: {detail}")
-        self.progress.progress(min(100, int(round((self.completed_steps / self.total_steps) * 100.0))), text=f"Failed ({self.completed_steps}/{self.total_steps})")
+        percent = min(100, int(round((self.completed_steps / self.total_steps) * 100.0)))
+        self.progress.progress(percent, text=f"Failed ({self.completed_steps}/{self.total_steps})")
         self.message.error(detail)
         self.log_box.code("\n".join(self.logs[-10:]), language="text")
 
@@ -395,17 +417,17 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
 
 
 def row_get(row: Any, key: str, default: Any = None) -> Any:
-    if isinstance(row, dict):
-        return row.get(key, default)
-    getter = getattr(row, "get", None)
-    if callable(getter):
-        return getter(key, default)
+    if row is None:
+        return default
+    if hasattr(row, "get"):
+        try:
+            return row.get(key, default)
+        except TypeError:
+            pass
     return getattr(row, key, default)
 
 
 class TupleRowAccessor:
-    __slots__ = ("row",)
-
     def __init__(self, row: Any) -> None:
         self.row = row
 
@@ -415,7 +437,7 @@ class TupleRowAccessor:
 
 def is_us_batch_ticker(ticker: str) -> bool:
     normalized = ticker.strip().upper()
-    return normalized in ML_BATCH_TICKERS and not bool(KOREAN_TICKER_PATTERN.fullmatch(normalized))
+    return not bool(KOREAN_TICKER_PATTERN.fullmatch(normalized))
 
 
 def _format_float(value: float | None, digits: int = 2) -> str:
@@ -427,7 +449,7 @@ def _format_float(value: float | None, digits: int = 2) -> str:
 def _format_pct(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "n/a"
-    return f"{value * 100.0:.1f}%"
+    return f"{value * 100:,.2f}%"
 
 
 def _format_score(value: float | None) -> str:
@@ -436,15 +458,45 @@ def _format_score(value: float | None) -> str:
     return f"{value:.0f}"
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _coerce_bool(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return False if pd.isna(value) else bool(value)
+
+
 def format_snapshot_label(snapshot: TickerSnapshot) -> str:
-    resolved = (snapshot.resolved_symbol or "").strip()
-    if not resolved or resolved == snapshot.ticker:
+    resolved = snapshot.resolved_symbol.strip().upper()
+    if resolved == snapshot.ticker.upper():
         return snapshot.ticker
     return f"{snapshot.ticker} ({resolved})"
 
 
-def weighted_component(score: float, weight: float) -> float:
-    return score * weight
+def ema_column(span: int) -> str:
+    return f"EMA{int(span)}"
+
+
+def config_to_display(config: RuleStrategyConfig) -> dict[str, Any]:
+    return {
+        "Fast EMA": config.fast_ema,
+        "Slow EMA": config.slow_ema,
+        "Bottom Votes": config.bottom_required,
+        "Buy Votes": config.buy_confirmation_required,
+        "Sell Votes": config.sell_confirmation_required,
+        "Buy Threshold": config.buy_score_threshold,
+        "Sell Threshold": config.sell_score_threshold,
+        "Need MACD": config.require_macd_for_buy,
+        "Need Volume": config.require_volume_for_buy,
+        "Allow Reclaim": config.allow_reclaim_trigger,
+        "Config Hash": config.config_hash(),
+    }
 
 
 def compute_stop_breach_metrics(
@@ -532,23 +584,34 @@ def calc_13612w_momentum(series: pd.Series) -> pd.Series:
     return momentum.replace([np.inf, -np.inf], np.nan)
 
 
-def build_controls() -> tuple[list[str], int, SignalPreset, bool]:
+def build_controls() -> dict[str, Any]:
     st.sidebar.subheader("Analysis Controls")
     watchlist_raw = st.sidebar.text_area(
         "Watchlist tickers",
         value=", ".join(DEFAULT_WATCHLIST),
-        help="This version is tuned only for SPY, QQQ, and 069500.KS (KODEX 200 ETF). Other inputs are ignored.",
+        help="Any ticker can be explored. Hold-beat completion is guaranteed only for SPY, QQQ, and 069500.KS.",
         height=96,
     )
-    history_years = st.sidebar.slider("History lookback (years)", min_value=1, max_value=5, value=3, step=1)
+    history_years = st.sidebar.slider("History lookback (years)", min_value=1, max_value=10, value=DEFAULT_HISTORY_YEARS, step=1)
+    search_budget = st.sidebar.selectbox("Search Budget", options=list(SEARCH_BUDGET_SPECS), index=list(SEARCH_BUDGET_SPECS).index(DEFAULT_SEARCH_BUDGET))
+    optimize = st.sidebar.button("Optimize", width="stretch")
+    resume_search = st.sidebar.button("Resume Search", width="stretch")
+    reset_search = st.sidebar.button("Reset Search", width="stretch")
     refresh = st.sidebar.button("Refresh cached data", width="stretch")
-    st.sidebar.caption("Balanced tuned mode only. SPY, QQQ, and KODEX 200 are the only supported assets.")
+    st.sidebar.caption("Core guarantee matrix: SPY / QQQ / 069500.KS x 1Y / 3Y / 5Y / Full.")
 
-    parsed_watchlist = parse_tickers(watchlist_raw)
-    watchlist = [ticker for ticker in parsed_watchlist if ticker in OPTIMIZED_TICKER_SET]
+    watchlist = dedupe_preserve_order(parse_tickers(watchlist_raw))
     if not watchlist:
         watchlist = list(DEFAULT_WATCHLIST)
-    return watchlist, int(history_years), DEFAULT_SIGNAL_PRESET, refresh
+    return {
+        "watchlist": watchlist,
+        "history_years": int(history_years),
+        "search_budget": str(search_budget),
+        "optimize": bool(optimize),
+        "resume_search": bool(resume_search),
+        "reset_search": bool(reset_search),
+        "refresh": bool(refresh),
+    }
 
 
 def normalize_datetime_index(index: Any) -> pd.DatetimeIndex:
@@ -1156,24 +1219,24 @@ def td_label_from_row(row: pd.Series) -> str:
     sell_cd = int(row.get("SellCountdown", 0) or 0)
     buy_setup = int(row.get("BuySetup", 0) or 0)
     sell_setup = int(row.get("SellSetup", 0) or 0)
-    if buy_cd == 13:
-        return "Buy countdown 13"
     if sell_cd == 13:
         return "Sell countdown 13"
-    if buy_setup >= 7:
-        return f"Buy setup {buy_setup}"
+    if buy_cd == 13:
+        return "Buy countdown 13"
     if sell_setup >= 7:
         return f"Sell setup {sell_setup}"
-    return "No exhaustion signal"
+    if buy_setup >= 7:
+        return f"Buy setup {buy_setup}"
+    return "No active TD setup"
 
 
 def build_td_label_series(frame: pd.DataFrame) -> pd.Series:
-    buy_setup = pd.to_numeric(frame["BuySetup"], errors="coerce").fillna(0).astype(int)
-    sell_setup = pd.to_numeric(frame["SellSetup"], errors="coerce").fillna(0).astype(int)
-    buy_countdown = pd.to_numeric(frame["BuyCountdown"], errors="coerce").fillna(0).astype(int)
-    sell_countdown = pd.to_numeric(frame["SellCountdown"], errors="coerce").fillna(0).astype(int)
+    labels = pd.Series("No active TD setup", index=frame.index, dtype=object)
+    sell_setup = pd.to_numeric(frame.get("SellSetup"), errors="coerce").fillna(0).astype(int)
+    buy_setup = pd.to_numeric(frame.get("BuySetup"), errors="coerce").fillna(0).astype(int)
+    sell_countdown = pd.to_numeric(frame.get("SellCountdown"), errors="coerce").fillna(0).astype(int)
+    buy_countdown = pd.to_numeric(frame.get("BuyCountdown"), errors="coerce").fillna(0).astype(int)
 
-    labels = pd.Series("No exhaustion signal", index=frame.index, dtype="object")
     sell_setup_mask = sell_setup >= 7
     buy_setup_mask = buy_setup >= 7
     sell_countdown_mask = sell_countdown == 13
@@ -1202,10 +1265,9 @@ def compute_indicators(
     work = frame.copy()
     reference_symbol = (asset_symbol or "").upper()
     work["AssetSymbol"] = reference_symbol
-    work["ReferenceAsset"] = reference_symbol in OPTIMIZED_TICKER_SET
-    work["EMA20"] = work["Close"].ewm(span=20, adjust=False, min_periods=20).mean()
-    work["EMA50"] = work["Close"].ewm(span=50, adjust=False, min_periods=50).mean()
-    work["EMA200"] = work["Close"].ewm(span=200, adjust=False, min_periods=200).mean()
+    work["ReferenceAsset"] = reference_symbol in CORE_TICKER_SET
+    for span in EMA_ALL_SPANS:
+        work[ema_column(span)] = work["Close"].ewm(span=span, adjust=False, min_periods=span).mean()
     work["RSI"] = calc_rsi(work["Close"], period=14)
     work["ATR"] = calc_atr(work, period=14)
     work["MFI"] = calc_mfi(work, period=14)
@@ -1281,905 +1343,14 @@ def compute_indicators(
     return work
 
 
-def attach_rule_only_columns(
-    state_frame: pd.DataFrame,
-    model_mode: str = "rules_only",
-    sell_veto_profile: str = ML_DEFAULT_SELL_VETO_PROFILE,
-) -> pd.DataFrame:
-    if state_frame.empty:
-        frame = state_frame.copy()
-        for column, default in [
-            ("MLBuyProb", np.nan),
-            ("MLSellProb", np.nan),
-            ("MLBuyApproved", True),
-            ("MLSellApproved", True),
-            ("ModelMode", model_mode),
-            ("SellVetoProfile", sell_veto_profile),
-            ("StrategySource", "RuleOnly"),
-            ("SignalNote", ""),
-        ]:
-            frame[column] = default
-        return frame
-
-    frame = state_frame.copy()
-    frame["MLBuyProb"] = pd.to_numeric(frame.get("MLBuyProb", np.nan), errors="coerce")
-    frame["MLSellProb"] = pd.to_numeric(frame.get("MLSellProb", np.nan), errors="coerce")
-    frame["MLBuyApproved"] = frame.get("MLBuyApproved", True)
-    frame["MLSellApproved"] = frame.get("MLSellApproved", True)
-    frame["ModelMode"] = frame.get("ModelMode", model_mode)
-    frame["SellVetoProfile"] = frame.get("SellVetoProfile", sell_veto_profile)
-    frame["StrategySource"] = frame.get("StrategySource", "RuleOnly")
-    frame["SignalNote"] = frame.get("SignalNote", "")
-    frame["MLBuyApproved"] = frame["MLBuyApproved"].fillna(True).astype(bool)
-    frame["MLSellApproved"] = frame["MLSellApproved"].fillna(True).astype(bool)
-    frame["SellVetoProfile"] = frame["SellVetoProfile"].fillna(sell_veto_profile).astype(str)
-    return frame
-
-
-def sanitize_feature_symbol(symbol: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "_", symbol.upper()).strip("_")
-
-
-def build_cross_asset_feature_frame(
-    target_index: pd.Index,
-    price_payloads: dict[str, dict[str, Any]],
-    *,
-    target_symbol: str,
-) -> pd.DataFrame:
-    features: dict[str, pd.Series] = {}
-    normalized_target = target_symbol.upper()
-    for symbol in ML_FEATURE_TICKERS:
-        if symbol.upper() == normalized_target:
-            continue
-        payload = price_payloads.get(symbol.upper()) or price_payloads.get(symbol)
-        if not payload:
-            continue
-        frame = payload.get("frame", pd.DataFrame())
-        if frame.empty or "Close" not in frame.columns:
-            continue
-        close = align_series_to_target_index(frame["Close"], target_index)
-        prefix = sanitize_feature_symbol(symbol)
-        returns = close.pct_change()
-        sma20 = close.rolling(20, min_periods=20).mean()
-        sma50 = close.rolling(50, min_periods=50).mean()
-        std20 = close.rolling(20, min_periods=20).std().replace(0.0, np.nan)
-        features[f"{prefix}_RET1"] = close.pct_change(1)
-        features[f"{prefix}_RET5"] = close.pct_change(5)
-        features[f"{prefix}_RET20"] = close.pct_change(20)
-        features[f"{prefix}_RET63"] = close.pct_change(63)
-        features[f"{prefix}_VOL20"] = returns.rolling(20, min_periods=20).std() * np.sqrt(252.0)
-        features[f"{prefix}_SMA20_GAP"] = close / sma20 - 1.0
-        features[f"{prefix}_SMA50_GAP"] = close / sma50 - 1.0
-        features[f"{prefix}_Z20"] = (close - sma20) / std20
-    if not features:
-        return pd.DataFrame(index=normalize_datetime_index(target_index))
-    return pd.DataFrame(features, index=normalize_datetime_index(target_index)).replace([np.inf, -np.inf], np.nan)
-
-
-def build_ml_feature_frame(
-    indicator_frame: pd.DataFrame,
-    baseline_state_frame: pd.DataFrame,
-    price_payloads: dict[str, dict[str, Any]],
-    *,
-    target_symbol: str,
-) -> pd.DataFrame:
-    joined = indicator_frame.join(
-        baseline_state_frame.loc[
-            :,
-            [
-                "BuyScore",
-                "SellScore",
-                "BuySetupActive",
-                "SellSetupActive",
-                "BuyTrigger",
-                "SellTrigger",
-                "HoldLockActive",
-                "ReentryLockActive",
-                "StopExitConfirmed",
-                "StopEmergencyExit",
-            ],
-        ],
-        how="left",
-    ).copy()
-    regime_map = {
-        "Bull Trend": 2,
-        "Bull Pullback": 1,
-        "Range / Transition": 0,
-        "Bear Rally": -1,
-        "Bear Trend": -2,
-    }
-    joined["RegimeCode"] = joined.get("Regime", pd.Series(index=joined.index, dtype=object)).map(regime_map).fillna(0).astype(float)
-    drop_columns = {
-        "AssetSymbol",
-        "TDLabel",
-        "Regime",
-        "State",
-        "SignalNote",
-        "BuyReasonText",
-        "SellReasonText",
-    }
-    feature_frame = joined.drop(columns=[column for column in drop_columns if column in joined.columns], errors="ignore").copy()
-    for column in feature_frame.columns:
-        if pd.api.types.is_bool_dtype(feature_frame[column]):
-            feature_frame[column] = feature_frame[column].astype(int)
-    feature_frame = feature_frame.apply(pd.to_numeric, errors="coerce")
-    feature_frame = feature_frame.join(
-        build_cross_asset_feature_frame(feature_frame.index, price_payloads, target_symbol=target_symbol),
-        how="left",
-    )
-    return feature_frame.replace([np.inf, -np.inf], np.nan)
-
-
-def infer_position_flags(state_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
-    if state_frame.empty:
-        return pd.DataFrame(index=state_frame.index, columns=["InPositionBefore", "InPositionAfter"], dtype=bool)
-
-    rows = state_frame.reset_index(drop=True)
-    in_position_before: list[bool] = []
-    in_position_after: list[bool] = []
-    in_position = False
-    last_buy_index = -10_000
-    last_sell_index = -10_000
-    entry_index = -10_000
-    min_hold_bars = preset_min_hold_bars(preset)
-
-    for position, row in enumerate(rows.itertuples(index=False, name="PositionRow")):
-        in_position_before.append(in_position)
-        buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", False))
-        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", False))
-        buy_ready = (not in_position) and buy_trigger and (position - last_buy_index) >= preset.cooldown_bars
-        hold_bars_elapsed = position - entry_index if in_position else 10_000
-        force_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
-        sell_ready = (
-            in_position
-            and sell_trigger
-            and ((hold_bars_elapsed >= min_hold_bars) or force_exit)
-            and (position - last_sell_index) >= preset.cooldown_bars
-        )
-
-        if buy_ready:
-            in_position = True
-            last_buy_index = position
-            entry_index = position
-        elif sell_ready:
-            in_position = False
-            last_sell_index = position
-            entry_index = -10_000
-        in_position_after.append(in_position)
-
-    return pd.DataFrame({"InPositionBefore": in_position_before, "InPositionAfter": in_position_after}, index=state_frame.index)
-
-
-def build_ml_label_frame(state_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
-    if state_frame.empty:
-        return pd.DataFrame(index=state_frame.index)
-
-    frame = state_frame.copy()
-    position_flags = infer_position_flags(frame, preset)
-    frame = frame.join(position_flags, how="left")
-
-    buy_candidate = frame["BuyTrigger"].fillna(False).astype(bool)
-    sell_candidate = (
-        frame["InPositionBefore"].fillna(False).astype(bool)
-        & frame["SellTrigger"].fillna(False).astype(bool)
-        & ~frame["StopExitConfirmed"].fillna(False).astype(bool)
-        & ~frame["StopEmergencyExit"].fillna(False).astype(bool)
-    )
-
-    buy_label = pd.Series(False, index=frame.index, dtype=bool)
-    sell_label = pd.Series(False, index=frame.index, dtype=bool)
-    buy_forward_return = pd.Series(np.nan, index=frame.index, dtype=float)
-    sell_edge = pd.Series(np.nan, index=frame.index, dtype=float)
-
-    rows = frame.reset_index(drop=True)
-    for position, row in enumerate(rows.itertuples(index=False, name="LabelRow")):
-        if buy_candidate.iloc[position]:
-            entry_position = position + 1
-            if entry_position < len(rows):
-                entry_open = _coerce_float(getattr(rows.iloc[entry_position], "Open", np.nan))
-                atr_value = _coerce_float(getattr(row, "ATR", np.nan))
-                if entry_open is not None and atr_value is not None and atr_value > 0:
-                    target_price = entry_open + (atr_value * ML_BUY_TARGET_ATR)
-                    stop_price = entry_open - (atr_value * ML_BUY_STOP_ATR)
-                    hit_target_first = False
-                    horizon_end = min(len(rows), entry_position + ML_BUY_HORIZON_BARS)
-                    for future_position in range(entry_position, horizon_end):
-                        future_row = rows.iloc[future_position]
-                        future_high = _coerce_float(getattr(future_row, "High", np.nan))
-                        future_low = _coerce_float(getattr(future_row, "Low", np.nan))
-                        if future_high is None or future_low is None:
-                            continue
-                        if future_low <= stop_price and future_high >= target_price:
-                            hit_target_first = False
-                            break
-                        if future_low <= stop_price:
-                            hit_target_first = False
-                            break
-                        if future_high >= target_price:
-                            net_return = target_price / entry_open - 1.0 - (2.0 * ML_TRANSACTION_COST)
-                            hit_target_first = net_return > 0.0
-                            break
-                    exit_position = min(len(rows) - 1, horizon_end - 1)
-                    exit_close = _coerce_float(getattr(rows.iloc[exit_position], "Close", np.nan))
-                    if exit_close is not None:
-                        buy_forward_return.iloc[position] = exit_close / entry_open - 1.0 - (2.0 * ML_TRANSACTION_COST)
-                    buy_label.iloc[position] = hit_target_first
-
-        if sell_candidate.iloc[position]:
-            exit_position = position + 1
-            hold_position = min(len(rows) - 1, position + ML_SELL_HOLDOUT_BARS)
-            if exit_position < len(rows):
-                next_open = _coerce_float(getattr(rows.iloc[exit_position], "Open", np.nan))
-                anchor_close = _coerce_float(getattr(row, "Close", np.nan))
-                hold_close = _coerce_float(getattr(rows.iloc[hold_position], "Close", np.nan))
-                if next_open is not None and anchor_close is not None and hold_close is not None and anchor_close > 0:
-                    immediate_exit_return = next_open / anchor_close - 1.0 - ML_TRANSACTION_COST
-                    hold_return = hold_close / anchor_close - 1.0 - ML_TRANSACTION_COST
-                    sell_edge.iloc[position] = immediate_exit_return - hold_return
-                    sell_label.iloc[position] = immediate_exit_return > hold_return
-
-    return pd.DataFrame(
-        {
-            "BuyCandidate": buy_candidate,
-            "SellCandidate": sell_candidate,
-            "BuyLabel": buy_label,
-            "SellLabel": sell_label,
-            "BuyForwardReturn": buy_forward_return,
-            "SellEdge": sell_edge,
-            "InPositionBefore": frame["InPositionBefore"].fillna(False).astype(bool),
-            "InPositionAfter": frame["InPositionAfter"].fillna(False).astype(bool),
-        },
-        index=frame.index,
-    )
-
-
-def resolve_boosting_descriptor(prefer_lightgbm: bool = True) -> ModelDescriptor:
-    if prefer_lightgbm and LIGHTGBM_AVAILABLE and LGBMClassifier is not None:
-        return ModelDescriptor(name="lightgbm", estimator_name="LGBMClassifier")
-    return ModelDescriptor(name="hist_gradient_boosting", estimator_name="HistGradientBoostingClassifier")
-
-
-def build_random_forest_estimator() -> RandomForestClassifier:
-    return RandomForestClassifier(
-        n_estimators=280,
-        max_depth=7,
-        min_samples_leaf=6,
-        min_samples_split=12,
-        class_weight="balanced_subsample",
-        random_state=ML_RANDOM_STATE,
-        n_jobs=-1,
-    )
-
-
-def build_boosting_estimator(prefer_lightgbm: bool = True) -> HistGradientBoostingClassifier | Any:
-    descriptor = resolve_boosting_descriptor(prefer_lightgbm=prefer_lightgbm)
-    if descriptor.name == "lightgbm":
-        return LGBMClassifier(
-            objective="binary",
-            n_estimators=220,
-            learning_rate=0.045,
-            num_leaves=31,
-            min_child_samples=18,
-            subsample=0.85,
-            subsample_freq=1,
-            colsample_bytree=0.85,
-            reg_alpha=0.1,
-            reg_lambda=0.2,
-            random_state=ML_RANDOM_STATE,
-            n_jobs=-1,
-            verbose=-1,
-        )
-    return HistGradientBoostingClassifier(
-        loss="log_loss",
-        max_depth=6,
-        max_iter=220,
-        learning_rate=0.045,
-        min_samples_leaf=18,
-        l2_regularization=0.1,
-        max_leaf_nodes=31,
-        random_state=ML_RANDOM_STATE,
-    )
-
-
-def prepare_feature_matrix(
-    frame: pd.DataFrame,
-    feature_columns: list[str],
-    *,
-    reference_frame: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    numeric = frame.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    reference_numeric = numeric if reference_frame is None else reference_frame.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    fill_values = reference_numeric.median(numeric_only=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return numeric.fillna(fill_values).astype(float)
-
-
-def fit_calibrated_binary_classifier(
-    estimator_factory: Callable[[], Any],
-    X: pd.DataFrame,
-    y: pd.Series,
-) -> Any | None:
-    if X.empty or y.empty:
-        return None
-    y_int = pd.to_numeric(y, errors="coerce").fillna(0).astype(int)
-    class_counts = y_int.value_counts()
-    if len(class_counts) < 2 or int(class_counts.min()) < 2:
-        return None
-    cv_folds = min(3, int(class_counts.min()))
-    if cv_folds < 2:
-        return None
-    try:
-        model = CalibratedClassifierCV(
-            estimator=estimator_factory(),
-            method="sigmoid",
-            cv=cv_folds,
-            ensemble=False,
-        )
-        model.fit(X, y_int)
-    except Exception:
-        return None
-    return model
-
-
-def predict_binary_probabilities(model: Any | None, X: pd.DataFrame) -> np.ndarray:
-    if model is None or X.empty:
-        return np.full(len(X), np.nan, dtype=float)
-    try:
-        probabilities = model.predict_proba(X)[:, 1]
-    except Exception:
-        return np.full(len(X), np.nan, dtype=float)
-    return np.asarray(probabilities, dtype=float)
-
-
-def _combine_probability_columns(columns: list[np.ndarray]) -> np.ndarray:
-    if not columns:
-        return np.array([], dtype=float)
-    matrix = np.column_stack(columns)
-    with np.errstate(invalid="ignore"):
-        combined = np.nanmean(matrix, axis=1)
-    if matrix.shape[1] == 0:
-        return np.full(matrix.shape[0], np.nan, dtype=float)
-    all_nan_mask = np.isnan(matrix).all(axis=1)
-    combined[all_nan_mask] = np.nan
-    return combined
-
-
-def build_probability_views_for_target(
-    train_feature_frame: pd.DataFrame,
-    train_candidate_mask: pd.Series,
-    train_label: pd.Series,
-    test_feature_frame: pd.DataFrame,
-    test_candidate_mask: pd.Series,
-    feature_columns: list[str],
-    *,
-    prefer_lightgbm: bool = True,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], str]:
-    descriptor = resolve_boosting_descriptor(prefer_lightgbm=prefer_lightgbm)
-    model_names = ["random_forest", descriptor.name, "soft_ensemble"]
-    train_views = {name: np.full(len(train_feature_frame), np.nan, dtype=float) for name in model_names}
-    test_views = {name: np.full(len(test_feature_frame), np.nan, dtype=float) for name in model_names}
-
-    candidate_train = train_candidate_mask.fillna(False).astype(bool)
-    candidate_test = test_candidate_mask.fillna(False).astype(bool)
-    if int(candidate_train.sum()) < ML_MIN_CANDIDATE_SAMPLES:
-        return train_views, test_views, descriptor.name
-
-    y_train = pd.to_numeric(train_label.loc[candidate_train], errors="coerce").fillna(0).astype(int)
-    if y_train.nunique() < 2:
-        return train_views, test_views, descriptor.name
-
-    reference_frame = train_feature_frame.loc[:, feature_columns]
-    X_train_candidates = prepare_feature_matrix(train_feature_frame.loc[candidate_train], feature_columns, reference_frame=reference_frame)
-    X_test_candidates = prepare_feature_matrix(test_feature_frame.loc[candidate_test], feature_columns, reference_frame=reference_frame) if candidate_test.any() else pd.DataFrame(columns=feature_columns)
-
-    rf_model = fit_calibrated_binary_classifier(build_random_forest_estimator, X_train_candidates, y_train)
-    boost_model = fit_calibrated_binary_classifier(lambda: build_boosting_estimator(prefer_lightgbm=prefer_lightgbm), X_train_candidates, y_train)
-
-    rf_train_probs = predict_binary_probabilities(rf_model, X_train_candidates)
-    boost_train_probs = predict_binary_probabilities(boost_model, X_train_candidates)
-    train_views["random_forest"][candidate_train.to_numpy()] = rf_train_probs
-    train_views[descriptor.name][candidate_train.to_numpy()] = boost_train_probs
-    train_views["soft_ensemble"][candidate_train.to_numpy()] = _combine_probability_columns([rf_train_probs, boost_train_probs])
-
-    if candidate_test.any():
-        rf_test_probs = predict_binary_probabilities(rf_model, X_test_candidates)
-        boost_test_probs = predict_binary_probabilities(boost_model, X_test_candidates)
-        test_views["random_forest"][candidate_test.to_numpy()] = rf_test_probs
-        test_views[descriptor.name][candidate_test.to_numpy()] = boost_test_probs
-        test_views["soft_ensemble"][candidate_test.to_numpy()] = _combine_probability_columns([rf_test_probs, boost_test_probs])
-
-    return train_views, test_views, descriptor.name
-
-
-def resolve_ml_sell_veto_profile(profile_name: str) -> MLSellVetoProfile:
-    return ML_SELL_VETO_PROFILE_MAP.get(
-        str(profile_name or ML_DEFAULT_SELL_VETO_PROFILE),
-        ML_SELL_VETO_PROFILE_MAP[ML_DEFAULT_SELL_VETO_PROFILE],
-    )
-
-
-def build_ml_sell_veto_mask(
-    filtered: pd.DataFrame,
-    *,
-    baseline_sell: pd.Series,
-    stop_protected: pd.Series,
-    ml_sell_approved: pd.Series,
-    profile: MLSellVetoProfile,
-) -> pd.Series:
-    veto_mask = pd.Series(False, index=filtered.index, dtype=bool)
-    if profile.name == ML_DEFAULT_SELL_VETO_PROFILE:
-        return veto_mask
-
-    veto_mask = baseline_sell & ml_sell_approved & ~stop_protected
-    if not veto_mask.any():
-        return veto_mask
-
-    if profile.bull_only:
-        regime = filtered.get("Regime", pd.Series("", index=filtered.index, dtype=object))
-        veto_mask &= regime.isin(ML_BULL_REGIMES)
-    if profile.max_cycle_score is not None:
-        cycle_score = pd.to_numeric(filtered.get("CycleScore", pd.Series(np.nan, index=filtered.index)), errors="coerce")
-        veto_mask &= cycle_score.le(profile.max_cycle_score).fillna(False)
-    if profile.max_sell_score is not None:
-        sell_score = pd.to_numeric(filtered.get("SellScore", pd.Series(np.nan, index=filtered.index)), errors="coerce")
-        veto_mask &= sell_score.le(profile.max_sell_score).fillna(False)
-    if profile.min_rs_percentile is not None:
-        rs_percentile = pd.to_numeric(filtered.get("RSPercentile", pd.Series(np.nan, index=filtered.index)), errors="coerce")
-        veto_mask &= rs_percentile.ge(profile.min_rs_percentile).fillna(False)
-    if profile.max_fear_greed is not None:
-        fear_greed = pd.to_numeric(filtered.get("FearGreed", pd.Series(np.nan, index=filtered.index)), errors="coerce")
-        veto_mask &= fear_greed.le(profile.max_fear_greed).fillna(False)
-    return veto_mask.fillna(False)
-
-
-def apply_ml_thresholds_to_state_frame(
-    base_state_frame: pd.DataFrame,
-    buy_probabilities: pd.Series | np.ndarray,
-    sell_probabilities: pd.Series | np.ndarray,
-    buy_threshold: float,
-    sell_threshold: float,
-    *,
-    model_mode: str,
-    sell_veto_profile: str = ML_DEFAULT_SELL_VETO_PROFILE,
-) -> pd.DataFrame:
-    if base_state_frame.empty:
-        return attach_rule_only_columns(
-            base_state_frame.copy(),
-            model_mode=model_mode,
-            sell_veto_profile=sell_veto_profile,
-        )
-
-    filtered = base_state_frame.copy()
-    sell_veto = resolve_ml_sell_veto_profile(sell_veto_profile)
-    buy_prob_series = pd.Series(buy_probabilities, index=base_state_frame.index, dtype=float)
-    sell_prob_series = pd.Series(sell_probabilities, index=base_state_frame.index, dtype=float)
-    baseline_buy = filtered["BuyTrigger"].fillna(False).astype(bool)
-    baseline_sell = filtered["SellTrigger"].fillna(False).astype(bool)
-    stop_protected = filtered["StopExitConfirmed"].fillna(False).astype(bool) | filtered["StopEmergencyExit"].fillna(False).astype(bool)
-    fear_greed = pd.Series(
-        pd.to_numeric(filtered.get("FearGreed", pd.Series(np.nan, index=filtered.index)), errors="coerce"),
-        index=filtered.index,
-        dtype=float,
-    )
-
-    ml_buy_approved = pd.Series(True, index=filtered.index, dtype=bool)
-    ml_sell_approved = pd.Series(True, index=filtered.index, dtype=bool)
-
-    buy_known = buy_prob_series.notna()
-    sell_known = sell_prob_series.notna()
-    ml_buy_approved.loc[baseline_buy & buy_known] = buy_prob_series.loc[baseline_buy & buy_known] >= buy_threshold
-    ml_sell_approved.loc[baseline_sell & sell_known] = sell_prob_series.loc[baseline_sell & sell_known] >= sell_threshold
-    ml_sell_approved.loc[stop_protected] = True
-    macro_fear_veto = baseline_buy & fear_greed.lt(ML_MACRO_FEAR_BUY_VETO).fillna(False)
-    ml_buy_approved.loc[macro_fear_veto] = False
-    sell_veto_mask = build_ml_sell_veto_mask(
-        filtered,
-        baseline_sell=baseline_sell,
-        stop_protected=stop_protected,
-        ml_sell_approved=ml_sell_approved,
-        profile=sell_veto,
-    )
-    ml_sell_approved.loc[sell_veto_mask] = False
-
-    filtered["MLBuyProb"] = buy_prob_series
-    filtered["MLSellProb"] = sell_prob_series
-    filtered["MLBuyApproved"] = ml_buy_approved
-    filtered["MLSellApproved"] = ml_sell_approved
-    filtered["ModelMode"] = filtered.get("ModelMode", model_mode)
-    filtered["SellVetoProfile"] = filtered.get("SellVetoProfile", sell_veto.name)
-    filtered["StrategySource"] = "RuleOnly"
-
-    filtered.loc[baseline_buy & ml_buy_approved, "StrategySource"] = "MLApprovedBuy"
-    filtered.loc[baseline_buy & ~ml_buy_approved, "StrategySource"] = "MLBlockedBuy"
-    filtered.loc[baseline_sell & ml_sell_approved & ~stop_protected, "StrategySource"] = "MLApprovedSell"
-    filtered.loc[baseline_sell & ~ml_sell_approved & ~stop_protected, "StrategySource"] = "MLBlockedSell"
-    filtered.loc[stop_protected, "StrategySource"] = "HardStop"
-    filtered.loc[macro_fear_veto, "StrategySource"] = "MacroFearVeto"
-    filtered.loc[sell_veto_mask, "StrategySource"] = "MLSellVeto"
-
-    filtered["BuyTrigger"] = baseline_buy & ml_buy_approved
-    filtered["SellTrigger"] = baseline_sell & (ml_sell_approved | stop_protected)
-    buy_side = filtered["State"].isin(["Strong Buy", "Buy", "Weak Buy"])
-    sell_side = filtered["State"].isin(["Strong Sell", "Sell", "Weak Sell"])
-    filtered.loc[buy_side & baseline_buy & ~filtered["BuyTrigger"], "State"] = "Hold / Neutral"
-    filtered.loc[sell_side & baseline_sell & ~filtered["SellTrigger"] & ~stop_protected, "State"] = "Hold / Neutral"
-    filtered["SignalNote"] = ""
-    return attach_rule_only_columns(
-        filtered,
-        model_mode=model_mode,
-        sell_veto_profile=sell_veto.name,
-    )
-
-
-def select_ml_strategy_for_state_frame(
-    symbol: str,
-    base_state_frame: pd.DataFrame,
-    buy_prob_views: dict[str, np.ndarray],
-    sell_prob_views: dict[str, np.ndarray],
-    preset: SignalPreset,
-) -> tuple[str, MLThresholdSelection] | None:
-    best_selection: tuple[str, MLThresholdSelection] | None = None
-    best_score = (-10_000.0, -10_000.0, -1.0, -1)
-
-    candidate_model_names = [name for name in buy_prob_views if name in sell_prob_views]
-    for model_name in candidate_model_names:
-        if np.isnan(buy_prob_views[model_name]).all() and np.isnan(sell_prob_views[model_name]).all():
-            continue
-        for buy_threshold in ML_THRESHOLD_GRID:
-            for sell_threshold in ML_THRESHOLD_GRID:
-                for sell_veto_profile in ML_ACTIVE_SELL_VETO_PROFILES:
-                    filtered = apply_ml_thresholds_to_state_frame(
-                        base_state_frame,
-                        buy_prob_views[model_name],
-                        sell_prob_views[model_name],
-                        buy_threshold,
-                        sell_threshold,
-                        model_mode=model_name,
-                        sell_veto_profile=sell_veto_profile.name,
-                    )
-                    summary = build_trade_replay_from_state_frame(symbol, filtered, preset)[2]
-                    excess_return = -10_000.0 if summary.get("excess_return") is None else float(summary["excess_return"])
-                    strategy_total_return = -10_000.0 if summary.get("strategy_total_return") is None else float(summary["strategy_total_return"])
-                    win_rate = -1.0 if summary.get("win_rate") is None else float(summary["win_rate"])
-                    closed_trades = int(summary["closed_trades"] or 0)
-                    score = (excess_return, strategy_total_return, win_rate, closed_trades)
-                    if score > best_score:
-                        best_score = score
-                        best_selection = (
-                            model_name,
-                            MLThresholdSelection(
-                                buy_threshold=buy_threshold,
-                                sell_threshold=sell_threshold,
-                                sell_veto_profile=sell_veto_profile.name,
-                                summary=summary,
-                            ),
-                        )
-    return best_selection
-
-
-def build_ml_walkforward_bundle(
-    symbol: str,
-    indicator_frame: pd.DataFrame,
-    baseline_state_frame: pd.DataFrame,
-    price_payloads: dict[str, dict[str, Any]],
-    preset: SignalPreset,
-) -> dict[str, Any]:
-    if symbol.upper() != ML_TARGET_SYMBOL or indicator_frame.empty or baseline_state_frame.empty:
-        return {
-            "enabled": False,
-            "model_mode": "rules_only",
-            "reason": "Rule-only asset",
-            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
-            "comparison": {},
-            "selection_frame": pd.DataFrame(),
-            "oos_start": None,
-        }
-
-    feature_frame = build_ml_feature_frame(indicator_frame, baseline_state_frame, price_payloads, target_symbol=symbol)
-    label_frame = build_ml_label_frame(baseline_state_frame, preset)
-    feature_columns = [column for column in feature_frame.columns if feature_frame[column].notna().sum() >= 30]
-    if not feature_columns:
-        return {
-            "enabled": False,
-            "model_mode": "rules_only",
-            "reason": "No usable ML features",
-            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
-            "comparison": {},
-            "selection_frame": pd.DataFrame(),
-            "oos_start": None,
-        }
-
-    try:
-        splitter = TimeSeriesSplit(
-            n_splits=ML_CV_SPLITS,
-            test_size=ML_CV_TEST_SIZE,
-            gap=ML_CV_GAP,
-        )
-        splits = list(splitter.split(feature_frame))
-    except Exception as exc:
-        return {
-            "enabled": False,
-            "model_mode": "rules_only",
-            "reason": f"TimeSeriesSplit unavailable: {exc}",
-            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
-            "comparison": {},
-            "selection_frame": pd.DataFrame(),
-            "oos_start": None,
-        }
-
-    if not splits:
-        return {
-            "enabled": False,
-            "model_mode": "rules_only",
-            "reason": "Insufficient rows for walk-forward split",
-            "state_frame": attach_rule_only_columns(baseline_state_frame.copy()),
-            "comparison": {},
-            "selection_frame": pd.DataFrame(),
-            "oos_start": None,
-        }
-
-    index = feature_frame.index
-    buy_prob_series = pd.Series(np.nan, index=index, dtype=float)
-    sell_prob_series = pd.Series(np.nan, index=index, dtype=float)
-    buy_approved_series = pd.Series(True, index=index, dtype=bool)
-    sell_approved_series = pd.Series(True, index=index, dtype=bool)
-    model_mode_series = pd.Series("rules_only", index=index, dtype=object)
-    sell_veto_profile_series = pd.Series(ML_DEFAULT_SELL_VETO_PROFILE, index=index, dtype=object)
-    strategy_source_series = pd.Series("RuleOnlyWarmup", index=index, dtype=object)
-    selection_rows: list[dict[str, Any]] = []
-
-    for fold_number, (train_positions, test_positions) in enumerate(splits, start=1):
-        train_features = feature_frame.iloc[train_positions]
-        test_features = feature_frame.iloc[test_positions]
-        train_labels = label_frame.iloc[train_positions]
-        test_labels = label_frame.iloc[test_positions]
-
-        buy_train_views, buy_test_views, boosting_name = build_probability_views_for_target(
-            train_features,
-            train_labels["BuyCandidate"],
-            train_labels["BuyLabel"],
-            test_features,
-            test_labels["BuyCandidate"],
-            feature_columns,
-        )
-        sell_train_views, sell_test_views, _ = build_probability_views_for_target(
-            train_features,
-            train_labels["SellCandidate"],
-            train_labels["SellLabel"],
-            test_features,
-            test_labels["SellCandidate"],
-            feature_columns,
-        )
-        selection = select_ml_strategy_for_state_frame(symbol, baseline_state_frame.iloc[train_positions], buy_train_views, sell_train_views, preset)
-        if selection is None:
-            continue
-        model_mode, threshold_selection = selection
-        filtered_test = apply_ml_thresholds_to_state_frame(
-            baseline_state_frame.iloc[test_positions],
-            buy_test_views[model_mode],
-            sell_test_views[model_mode],
-            threshold_selection.buy_threshold,
-            threshold_selection.sell_threshold,
-            model_mode=model_mode,
-            sell_veto_profile=threshold_selection.sell_veto_profile,
-        )
-        test_index = index[test_positions]
-        buy_prob_series.loc[test_index] = filtered_test["MLBuyProb"].to_numpy(dtype=float)
-        sell_prob_series.loc[test_index] = filtered_test["MLSellProb"].to_numpy(dtype=float)
-        buy_approved_series.loc[test_index] = filtered_test["MLBuyApproved"].to_numpy(dtype=bool)
-        sell_approved_series.loc[test_index] = filtered_test["MLSellApproved"].to_numpy(dtype=bool)
-        model_mode_series.loc[test_index] = model_mode
-        sell_veto_profile_series.loc[test_index] = threshold_selection.sell_veto_profile
-        strategy_source_series.loc[test_index] = filtered_test["StrategySource"].to_numpy(dtype=object)
-        selection_rows.append(
-            {
-                "Fold": fold_number,
-                "TrainStart": index[train_positions[0]].date().isoformat(),
-                "TrainEnd": index[train_positions[-1]].date().isoformat(),
-                "TestStart": index[test_positions[0]].date().isoformat(),
-                "TestEnd": index[test_positions[-1]].date().isoformat(),
-                "ModelMode": model_mode,
-                "BoostingMode": boosting_name,
-                "BuyThreshold": threshold_selection.buy_threshold,
-                "SellThreshold": threshold_selection.sell_threshold,
-                "SellVetoProfile": threshold_selection.sell_veto_profile,
-                "WinRate": threshold_selection.summary["win_rate"],
-                "StrategyTotalReturn": threshold_selection.summary.get("strategy_total_return"),
-                "BuyHoldReturn": threshold_selection.summary.get("buy_hold_return"),
-                "ExcessReturn": threshold_selection.summary.get("excess_return"),
-                "AvgClosedReturn": threshold_selection.summary["avg_closed_return"],
-                "ClosedTrades": threshold_selection.summary["closed_trades"],
-            }
-        )
-
-    full_buy_views, _, boosting_name = build_probability_views_for_target(
-        feature_frame,
-        label_frame["BuyCandidate"],
-        label_frame["BuyLabel"],
-        feature_frame.iloc[0:0],
-        pd.Series(dtype=bool),
-        feature_columns,
-    )
-    full_sell_views, _, _ = build_probability_views_for_target(
-        feature_frame,
-        label_frame["SellCandidate"],
-        label_frame["SellLabel"],
-        feature_frame.iloc[0:0],
-        pd.Series(dtype=bool),
-        feature_columns,
-    )
-    full_selection = select_ml_strategy_for_state_frame(symbol, baseline_state_frame, full_buy_views, full_sell_views, preset)
-    if full_selection is None:
-        final_state = attach_rule_only_columns(baseline_state_frame.copy())
-        return {
-            "enabled": False,
-            "model_mode": "rules_only",
-            "reason": "ML models could not fit candidate labels",
-            "state_frame": final_state,
-            "comparison": {},
-            "selection_frame": pd.DataFrame(selection_rows),
-            "oos_start": None,
-        }
-
-    final_model_mode, final_thresholds = full_selection
-    final_filtered = apply_ml_thresholds_to_state_frame(
-        baseline_state_frame,
-        full_buy_views[final_model_mode],
-        full_sell_views[final_model_mode],
-        final_thresholds.buy_threshold,
-        final_thresholds.sell_threshold,
-        model_mode=final_model_mode,
-        sell_veto_profile=final_thresholds.sell_veto_profile,
-    )
-    missing_buy = buy_prob_series.isna() & final_filtered["MLBuyProb"].notna()
-    missing_sell = sell_prob_series.isna() & final_filtered["MLSellProb"].notna()
-    buy_prob_series.loc[missing_buy] = final_filtered.loc[missing_buy, "MLBuyProb"]
-    sell_prob_series.loc[missing_sell] = final_filtered.loc[missing_sell, "MLSellProb"]
-    buy_approved_series.loc[missing_buy] = final_filtered.loc[missing_buy, "MLBuyApproved"]
-    sell_approved_series.loc[missing_sell] = final_filtered.loc[missing_sell, "MLSellApproved"]
-    model_mode_series.loc[model_mode_series.eq("rules_only")] = final_model_mode
-    warmup_mask = strategy_source_series.eq("RuleOnlyWarmup")
-    sell_veto_profile_series.loc[warmup_mask] = final_thresholds.sell_veto_profile
-    strategy_source_series.loc[strategy_source_series.eq("RuleOnlyWarmup")] = final_filtered.loc[strategy_source_series.eq("RuleOnlyWarmup"), "StrategySource"]
-
-    final_state = baseline_state_frame.copy()
-    final_state["MLBuyProb"] = buy_prob_series
-    final_state["MLSellProb"] = sell_prob_series
-    final_state["MLBuyApproved"] = buy_approved_series
-    final_state["MLSellApproved"] = sell_approved_series
-    final_state["ModelMode"] = model_mode_series
-    final_state["SellVetoProfile"] = sell_veto_profile_series
-    final_state["StrategySource"] = strategy_source_series
-    final_state = apply_ml_thresholds_to_state_frame(
-        final_state,
-        final_state["MLBuyProb"],
-        final_state["MLSellProb"],
-        final_thresholds.buy_threshold,
-        final_thresholds.sell_threshold,
-        model_mode=final_model_mode,
-        sell_veto_profile=final_thresholds.sell_veto_profile,
-    )
-
-    oos_start = index[splits[0][1][0]]
-    baseline_oos = attach_rule_only_columns(baseline_state_frame.loc[oos_start:].copy())
-    final_oos = final_state.loc[oos_start:].copy()
-    rule_summary = build_trade_replay_from_state_frame(symbol, baseline_oos, preset)[2]
-    ml_summary = build_trade_replay_from_state_frame(symbol, final_oos, preset)[2]
-    rule_total_return = rule_summary.get("strategy_total_return")
-    ml_total_return = ml_summary.get("strategy_total_return")
-    if (
-        rule_total_return is not None
-        and ml_total_return is not None
-        and float(ml_total_return) <= float(rule_total_return)
-    ):
-        fallback_state = attach_rule_only_columns(baseline_state_frame.copy())
-        return {
-            "enabled": False,
-            "model_mode": "rules_only",
-            "reason": "Rule-only outperformed walk-forward ML; keeping rule strategy",
-            "state_frame": fallback_state,
-            "comparison": {
-                "rule_summary": rule_summary,
-                "ml_summary": ml_summary,
-                "buy_threshold": final_thresholds.buy_threshold,
-                "sell_threshold": final_thresholds.sell_threshold,
-                "sell_veto_profile": final_thresholds.sell_veto_profile,
-            },
-            "selection_frame": pd.DataFrame(selection_rows),
-            "oos_start": oos_start,
-        }
-    return {
-        "enabled": True,
-        "model_mode": final_model_mode,
-        "reason": f"Walk-forward ML filter active ({boosting_name}, sell veto={final_thresholds.sell_veto_profile})",
-        "state_frame": final_state,
-        "comparison": {
-            "rule_summary": rule_summary,
-            "ml_summary": ml_summary,
-            "buy_threshold": final_thresholds.buy_threshold,
-            "sell_threshold": final_thresholds.sell_threshold,
-            "sell_veto_profile": final_thresholds.sell_veto_profile,
-        },
-        "selection_frame": pd.DataFrame(selection_rows),
-        "oos_start": oos_start,
-    }
-
-
-def analyze_symbol_state(
-    ticker: str,
-    payload: dict[str, Any],
-    macro_data: dict[str, Any],
-    preset: SignalPreset,
-    *,
-    feature_payloads: dict[str, dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    price_frame = payload.get("frame", pd.DataFrame())
-    indicators = compute_indicators(
-        price_frame,
-        macro_data["score_series"],
-        macro_data.get("benchmark_close"),
-        macro_data.get("tips_13612w_momentum"),
-        payload.get("resolved_symbol"),
-    )
-    baseline_state_frame = attach_rule_only_columns(build_state_frame(indicators, preset))
-    ml_bundle = {
-        "enabled": False,
-        "model_mode": "rules_only",
-        "reason": "Rule-only asset",
-        "state_frame": baseline_state_frame,
-        "comparison": {},
-        "selection_frame": pd.DataFrame(),
-        "oos_start": None,
-    }
-    if payload.get("resolved_symbol", ticker).upper() == ML_TARGET_SYMBOL and feature_payloads is not None:
-        ml_bundle = build_ml_walkforward_bundle(ML_TARGET_SYMBOL, indicators, baseline_state_frame, feature_payloads, preset)
-    state_frame = attach_rule_only_columns(ml_bundle.get("state_frame", baseline_state_frame))
-    snapshot = build_snapshot(ticker, payload.get("resolved_symbol", ticker), state_frame, payload.get("warning"))
-    return {
-        "indicators": indicators,
-        "baseline_state_frame": baseline_state_frame,
-        "state_frame": state_frame,
-        "snapshot": snapshot,
-        "ml_bundle": ml_bundle,
-    }
-
-
-@st.cache_resource(show_spinner=False)
-def load_cached_qqq_analysis(start_iso: str, end_iso: str, preset_name: str) -> dict[str, Any]:
-    preset = PROFILE_PRESETS.get(preset_name, DEFAULT_SIGNAL_PRESET)
-    macro_data = load_macro_fear_greed_cached(end_iso)
-    feature_payloads = load_price_payloads(list(ML_BATCH_TICKERS), start_iso, end_iso)
-    qqq_payload = feature_payloads.get(ML_TARGET_SYMBOL, {"frame": pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)), "resolved_symbol": ML_TARGET_SYMBOL, "warning": "QQQ payload unavailable"})
-    return analyze_symbol_state(
-        ML_TARGET_SYMBOL,
-        qqq_payload,
-        macro_data,
-        preset,
-        feature_payloads=feature_payloads,
-    )
-
-
-def _coerce_float(value: Any) -> float | None:
-    if value is None or pd.isna(value):
-        return None
-    return float(value)
-
-
-def _coerce_bool(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    return False if pd.isna(value) else bool(value)
-
-
 def classify_market_regime(row: Any) -> str:
-    close_value = _coerce_float(row.get("Close"))
-    ema50 = _coerce_float(row.get("EMA50"))
-    ema200 = _coerce_float(row.get("EMA200"))
-    trend_delta = _coerce_float(row.get("TrendDelta5"))
-    adx = _coerce_float(row.get("ADX"))
-    plus_di = _coerce_float(row.get("PlusDI"))
-    minus_di = _coerce_float(row.get("MinusDI"))
+    close_value = _coerce_float(row_get(row, "Close"))
+    ema50 = _coerce_float(row_get(row, "EMA50"))
+    ema200 = _coerce_float(row_get(row, "EMA200"))
+    trend_delta = _coerce_float(row_get(row, "TrendDelta5"))
+    adx = _coerce_float(row_get(row, "ADX"))
+    plus_di = _coerce_float(row_get(row, "PlusDI"))
+    minus_di = _coerce_float(row_get(row, "MinusDI"))
 
     strong_trend = adx is not None and adx >= 23
     bull_context = all(value is not None for value in [close_value, ema50, ema200, trend_delta]) and bool(
@@ -2210,1275 +1381,335 @@ def _is_bear_regime(regime: str) -> bool:
     return regime in {"Bear Trend", "Bear Rally"}
 
 
-def detect_deep_value_confluence(row: Any) -> tuple[bool, bool]:
-    cycle_score = _coerce_float(row_get(row, "CycleScore"))
-    rsi = _coerce_float(row_get(row, "RSI"))
-    buy_setup = int(row_get(row, "BuySetup", 0) or 0)
-    buy_countdown = int(row_get(row, "BuyCountdown", 0) or 0)
-    close_value = _coerce_float(row_get(row, "Close"))
-    ema20 = _coerce_float(row_get(row, "EMA20"))
-    ema50 = _coerce_float(row_get(row, "EMA50"))
-    close_up_day = _coerce_bool(row_get(row, "CloseUpDay", False))
-
-    base_overlap = bool(
-        cycle_score is not None
-        and cycle_score <= DEEP_VALUE_CYCLE_THRESHOLD
-        and rsi is not None
-        and rsi <= DEEP_VALUE_RSI_THRESHOLD
-        and (buy_countdown == 13 or buy_setup >= DEEP_VALUE_SETUP_THRESHOLD)
-    )
-    ma_context = bool(
-        close_up_day
-        or (
-            close_value is not None
-            and ema20 is not None
-            and close_value <= (ema20 * 1.02)
-        )
-        or (
-            close_value is not None
-            and ema50 is not None
-            and close_value >= (ema50 * 0.98)
-        )
-    )
-    extreme_overlap = bool(
-        cycle_score is not None
-        and cycle_score <= DEEP_VALUE_EXTREME_CYCLE_THRESHOLD
-        and rsi is not None
-        and rsi <= DEEP_VALUE_EXTREME_RSI_THRESHOLD
-        and (
-            buy_countdown == 13
-            or buy_setup >= DEEP_VALUE_EXTREME_SETUP_THRESHOLD
-            or close_up_day
-        )
-    )
-    return base_overlap and ma_context, extreme_overlap
+def _sum_bool_columns(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
+    return frame.loc[:, columns].fillna(False).astype(bool).sum(axis=1).astype(int)
 
 
-def detect_heat_trim_confluence(row: Any) -> tuple[bool, bool]:
-    cycle_score = _coerce_float(row_get(row, "CycleScore"))
-    rsi = _coerce_float(row_get(row, "RSI"))
-    fear_greed = _coerce_float(row_get(row, "FearGreed"))
-    sell_setup = int(row_get(row, "SellSetup", 0) or 0)
-    sell_countdown = int(row_get(row, "SellCountdown", 0) or 0)
-    close_value = _coerce_float(row_get(row, "Close"))
-    ema20 = _coerce_float(row_get(row, "EMA20"))
-    ema50 = _coerce_float(row_get(row, "EMA50"))
-
-    ma_context = bool(
-        close_value is not None
-        and ema20 is not None
-        and ema50 is not None
-        and close_value >= ema20
-        and ema20 >= ema50
-    )
-    base_overlap = bool(
-        fear_greed is not None
-        and fear_greed >= HEAT_TRIM_FEAR_THRESHOLD
-        and rsi is not None
-        and rsi >= HEAT_TRIM_RSI_THRESHOLD
-        and (
-            sell_countdown == 13
-            or sell_setup >= HEAT_TRIM_SETUP_THRESHOLD
-            or (cycle_score is not None and cycle_score >= 72.0)
-        )
-    )
-    extreme_overlap = bool(
-        fear_greed is not None
-        and fear_greed >= HEAT_TRIM_EXTREME_FEAR_THRESHOLD
-        and rsi is not None
-        and rsi >= HEAT_TRIM_EXTREME_RSI_THRESHOLD
-        and (
-            sell_countdown == 13
-            or sell_setup >= HEAT_TRIM_EXTREME_SETUP_THRESHOLD
-            or (cycle_score is not None and cycle_score >= 80.0)
-        )
-    )
-    return base_overlap and ma_context, extreme_overlap and ma_context
-
-
-def detect_macro_trend_exit(row: Any) -> bool:
-    fear_greed = _coerce_float(row_get(row, "FearGreed"))
-    macd_bear_cross = _coerce_bool(row_get(row, "MACDBearCross", False))
-    return bool(
-        macd_bear_cross
-        and fear_greed is not None
-        and fear_greed < BUY_CUTOFFS["fear_reset"]
-    )
-
-
-def score_buy_signal(row: pd.Series) -> tuple[int, list[str]]:
-    score = 0.0
+def _build_buy_reason_parts(row: Any) -> list[str]:
     reasons: list[str] = []
-    regime = classify_market_regime(row)
-    bull_regime = _is_bull_regime(regime)
-    bear_regime = _is_bear_regime(regime)
-    reference_asset = _coerce_bool(row.get("ReferenceAsset"))
-
-    cycle_score = _coerce_float(row.get("CycleScore"))
-    buy_setup = int(row.get("BuySetup", 0) or 0)
-    buy_countdown = int(row.get("BuyCountdown", 0) or 0)
-    atr_stretch = _coerce_float(row.get("ATRStretch"))
-    rsi = _coerce_float(row.get("RSI"))
-    mfi = _coerce_float(row.get("MFI"))
-    mfi_change = _coerce_float(row.get("MFIChange5"))
-    fear_greed = _coerce_float(row.get("FearGreed"))
-    tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
-    rs_percentile = _coerce_float(row.get("RSPercentile"))
-    rs_momentum = _coerce_float(row.get("RSMomentum63"))
-    volume_ratio = _coerce_float(row.get("VolumeRatio20"))
-    cmf20 = _coerce_float(row.get("CMF20"))
-    obv_slope10 = _coerce_float(row.get("OBVSlope10"))
-    macd_hist = _coerce_float(row.get("MACDHist"))
-    macd_delta = _coerce_float(row.get("MACDHistDelta"))
-    macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
-    macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
-    bb_pos = _coerce_float(row.get("BBPos20"))
-    bb_width_pct = _coerce_float(row.get("BBWidthPct"))
-    volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
-    volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
-    volume_dry_up = _coerce_bool(row.get("VolumeDryUp"))
-    close_value = _coerce_float(row.get("Close"))
-    open_value = _coerce_float(row.get("Open"))
-    ema20 = _coerce_float(row.get("EMA20"))
-    deep_value_confluence, deep_value_extreme = detect_deep_value_confluence(row)
-    buy_rsi_reset = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
-    buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
-    buy_mfi_reset = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
-    buy_mfi_extreme = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_extreme"])
-    buy_fear_reset = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_reset"])
-    buy_fear_extreme = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_extreme"])
-    buy_bb_low = bool(bb_pos is not None and bb_pos <= BUY_CUTOFFS["bb_low"])
-    buy_bb_extreme = bool(bb_pos is not None and bb_pos <= 0.10)
-    buy_cutoff_hits = int(sum([buy_rsi_reset, buy_mfi_reset, buy_fear_reset, buy_bb_low]))
-    buy_extreme_hits = int(sum([buy_rsi_extreme, buy_mfi_extreme, buy_fear_extreme, buy_bb_extreme]))
-
-    deep_reversal = cycle_score is not None and cycle_score <= 15 and buy_countdown == 13
-    oversold_cluster = False
-    dryup_reversal = bool(
-        volume_dry_up
-        and cycle_score is not None
-        and cycle_score <= 25
-        and rsi is not None
-        and rsi <= 44
-    )
-    accumulation_flow = bool(
-        volume_climax_up
-        or (
-            cmf20 is not None
-            and cmf20 >= 0.05
-            and obv_slope10 is not None
-            and obv_slope10 > 0
-        )
-    )
-    distribution_pressure = bool(
-        volume_climax_down
-        or (
-            cmf20 is not None
-            and cmf20 <= -0.05
-            and obv_slope10 is not None
-            and obv_slope10 < 0
-        )
-    )
-    volume_support = bool(
-        (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
-        or (mfi_change is not None and mfi_change >= 5.0)
-        or accumulation_flow
-        or dryup_reversal
-    )
-    relative_support = bool(
-        (rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
-        or (rs_momentum is not None and rs_momentum >= (-0.03 if reference_asset else -0.01))
-    )
-    tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
-    chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
-
-    reversion_score = 0.0
-    if cycle_score is not None:
-        if cycle_score <= 15:
-            reversion_score += 18
-            reasons.append("STL capitulation low")
-        elif cycle_score <= 25:
-            reversion_score += 14
-            reasons.append("STL cycle low")
-        elif cycle_score <= 35:
-            reversion_score += 9
-            reasons.append("STL accumulation zone")
-        elif cycle_score <= 45:
-            reversion_score += 5
-            reasons.append("STL early reset")
-
-    if atr_stretch is not None:
-        if atr_stretch <= -1.8:
-            reversion_score += 10
-            oversold_cluster = True
-            reasons.append("ATR deep pullback")
-        elif atr_stretch <= -1.1:
-            reversion_score += 7
-            oversold_cluster = True
-            reasons.append("ATR pullback")
-        elif atr_stretch <= -0.6:
-            reversion_score += 3
-
-    if buy_rsi_extreme:
-        reversion_score += 10
-        oversold_cluster = True
-        reasons.append("RSI washed out")
-    elif buy_rsi_reset:
-        reversion_score += 7
-        oversold_cluster = True
-        reasons.append("RSI reset")
-
-    if buy_mfi_extreme:
-        reversion_score += 10
-        oversold_cluster = True
-        reasons.append("MFI capitulation")
-    elif buy_mfi_reset:
-        reversion_score += 7
-        oversold_cluster = True
-        reasons.append("MFI oversold")
-
-    if buy_bb_extreme:
-        reversion_score += 10
-        oversold_cluster = True
-        reasons.append("Bollinger lower-tag")
-    elif buy_bb_low:
-        reversion_score += 7
-        oversold_cluster = True
-        reasons.append("Bollinger low-zone")
-
-    if reference_asset and cycle_score is not None and rsi is not None:
-        if cycle_score <= 20 and rsi <= 45:
-            reversion_score += 12
-            reasons.append("Reference ETF washout")
-        elif cycle_score <= 30 and rsi <= 48:
-            reversion_score += 8
-            reasons.append("ETF low-zone reset")
-
-    if deep_value_confluence:
-        reversion_score += 12 if deep_value_extreme else 8
-        reasons.append("STL+TD+RSI washout")
-
-    reversion_cap = 28 if regime == "Range / Transition" else 24 if bull_regime else 20
-    if reference_asset:
-        reversion_cap += 8
-    reversion_score = min(reversion_cap, reversion_score)
-    score += weighted_component(reversion_score, BUY_COMPONENT_WEIGHTS["reversion"])
-
-    td_score = 0.0
-    if buy_countdown == 13:
-        td_score = 24
-        reasons.append("TD buy countdown 13")
-    elif buy_setup >= 9:
-        td_score = 18
-        reasons.append(f"TD buy setup {buy_setup}")
-    elif buy_setup >= 7:
-        td_score = 10
-        reasons.append(f"TD buy setup {buy_setup}")
-    elif reference_asset and buy_setup >= 5 and cycle_score is not None and cycle_score <= 35:
-        td_score = 8
-        reasons.append(f"TD early buy setup {buy_setup}")
-    score += weighted_component(td_score, BUY_COMPONENT_WEIGHTS["td"])
-
-    macro_score = 0.0
-    if buy_fear_extreme:
-        macro_score += 8
-        reasons.append("Macro fear tailwind")
-    elif buy_fear_reset:
-        macro_score += 4
-        reasons.append("Macro risk reset")
-    if tips_risk_off:
-        if deep_reversal:
-            macro_score -= 2
-        elif tips_momentum is not None and tips_momentum <= -0.03:
-            macro_score -= 8
-            reasons.append("TIPS 13612W risk-off")
-        else:
-            macro_score -= 5
-            reasons.append("TIPS macro headwind")
-    score += weighted_component(macro_score, BUY_COMPONENT_WEIGHTS["macro"])
-
-    relative_score = 0.0
-    if relative_support:
-        relative_score += 8 if rs_percentile is not None and rs_percentile >= 60 else 5
-        reasons.append("Relative strength supportive")
-    elif rs_percentile is not None and rs_percentile < 25:
-        relative_score -= 10
-        reasons.append("Relative strength weak")
-    elif rs_percentile is not None and rs_percentile < 40:
-        relative_score -= 4
-    score += weighted_component(relative_score, BUY_COMPONENT_WEIGHTS["relative"])
-
-    volume_score = 0.0
-    if accumulation_flow:
-        volume_score += 9
+    if _coerce_bool(row_get(row, "BottomRSILow")):
+        reasons.append("RSI low")
+    if _coerce_bool(row_get(row, "BottomSTLLow")):
+        reasons.append("RobustSTL low")
+    if _coerce_bool(row_get(row, "BottomFearLow")):
+        reasons.append("Fear & Greed low")
+    if _coerce_bool(row_get(row, "BuyConfirmTD")):
+        reasons.append("TD buy exhaustion")
+    if _coerce_bool(row_get(row, "BuyConfirmMACD")):
+        reasons.append("MACD turn")
+    if _coerce_bool(row_get(row, "BuyConfirmAccumulation")):
         reasons.append("Accumulation flow")
-    elif dryup_reversal:
-        volume_score += 5
-        reasons.append("Volume dry-up reset")
-    elif volume_support:
-        volume_score += 7
-        reasons.append("Volume-backed reversal")
-    elif mfi is not None and mfi < 25 and mfi_change is not None and mfi_change < 0 and bear_regime:
-        volume_score -= 8
-        reasons.append("Falling knife flow")
-    if distribution_pressure and not deep_reversal:
-        volume_score -= 8
-        reasons.append("Distribution pressure")
-    score += weighted_component(volume_score, BUY_COMPONENT_WEIGHTS["volume"])
-
-    macd_score = 0.0
-    if macd_bull_cross:
-        macd_score += 12 if macd_hist is not None and macd_hist <= 0 else 9
-        reasons.append("MACD bullish cross")
-    elif macd_delta is not None:
-        if macd_delta > 0 and macd_hist is not None and macd_hist <= 0:
-            macd_score += 8
-            reasons.append("MACD momentum turn")
-        elif macd_delta > 0 and macd_hist is not None and macd_hist > 0:
-            macd_score += 10
-            reasons.append("MACD bullish expansion")
-        elif macd_delta < 0 and bear_regime and not deep_reversal:
-            macd_score -= 5
-            reasons.append("MACD still falling")
-    if macd_bear_cross and not deep_reversal:
-        macd_score -= 6
-        reasons.append("MACD bear cross")
-    score += weighted_component(macd_score, BUY_COMPONENT_WEIGHTS["macd"])
-
-    regime_score = 0.0
-    if chop_zone:
-        if macd_bull_cross or accumulation_flow or deep_reversal:
-            regime_score += 3
-            reasons.append("Squeeze reversal support")
-        else:
-            regime_score -= 7
-            reasons.append("Bollinger squeeze chop")
-
-    if bull_regime:
-        regime_score += 8
-        reasons.append("Bull regime support")
-    elif regime == "Range / Transition":
-        regime_score += 3
-    elif not deep_reversal:
-        regime_score -= 6 if reference_asset else 12
-        reasons.append("Bear regime penalty")
-
-    if bull_regime and atr_stretch is not None and atr_stretch <= -0.5 and close_value is not None and ema20 is not None and close_value >= ema20:
-        regime_score += 6
-        reasons.append("Trend dip setup")
-    score += weighted_component(regime_score, BUY_COMPONENT_WEIGHTS["regime"])
-
-    confluence_count = int(sum(
-        [
-            bool(cycle_score is not None and cycle_score <= 35),
-            bool(buy_setup >= 8 or buy_countdown == 13),
-            oversold_cluster,
-            accumulation_flow or volume_support,
-            relative_support,
-            bool(buy_cutoff_hits >= 2 or buy_fear_reset),
-            bull_regime,
-            macd_bull_cross,
-            deep_value_confluence,
-        ]
-    ))
-    if confluence_count >= 3:
-        confluence_bonus = min(20.0, 6.0 + ((confluence_count - 3) * 4.0))
-        score += weighted_component(confluence_bonus, BUY_COMPONENT_WEIGHTS["confluence"])
-        reasons.append(f"{confluence_count}x buy confluence")
-    if buy_extreme_hits >= 2:
-        score += weighted_component(8.0, BUY_COMPONENT_WEIGHTS["confluence"])
-        reasons.append("Extreme oversold cutoffs")
-    elif buy_cutoff_hits >= 3:
-        score += weighted_component(5.0, BUY_COMPONENT_WEIGHTS["confluence"])
-        reasons.append("Multi-cutoff washout")
-
-    if _coerce_bool(row.get("BuyTriggerPrice")):
-        score += weighted_component(6.0, BUY_COMPONENT_WEIGHTS["confirmation"])
-        reasons.append("Price confirmation")
-
-    if bear_regime and not deep_reversal:
-        score = min(score, 70.0 if reference_asset else 62.0)
-    return max(0, min(100, int(round(score)))), reasons[:5]
+    if _coerce_bool(row_get(row, "BuyConfirmVolumeReset")):
+        reasons.append("Volume reset")
+    if _coerce_bool(row_get(row, "BuyMACrossUp")):
+        reasons.append("EMA bull cross")
+    elif _coerce_bool(row_get(row, "BuyMAReclaim")):
+        reasons.append("EMA reclaim")
+    return reasons[:5]
 
 
-def score_sell_signal(row: pd.Series) -> tuple[int, list[str]]:
-    score = 0.0
+def _build_sell_reason_parts(row: Any) -> list[str]:
     reasons: list[str] = []
-    regime = classify_market_regime(row)
-    bull_regime = _is_bull_regime(regime)
-    bear_regime = _is_bear_regime(regime)
-    reference_asset = _coerce_bool(row.get("ReferenceAsset"))
-
-    cycle_score = _coerce_float(row.get("CycleScore"))
-    sell_setup = int(row.get("SellSetup", 0) or 0)
-    sell_countdown = int(row.get("SellCountdown", 0) or 0)
-    atr_stretch = _coerce_float(row.get("ATRStretch"))
-    rsi = _coerce_float(row.get("RSI"))
-    mfi = _coerce_float(row.get("MFI"))
-    mfi_change = _coerce_float(row.get("MFIChange5"))
-    fear_greed = _coerce_float(row.get("FearGreed"))
-    tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
-    rs_percentile = _coerce_float(row.get("RSPercentile"))
-    rs_momentum = _coerce_float(row.get("RSMomentum63"))
-    volume_ratio = _coerce_float(row.get("VolumeRatio20"))
-    cmf20 = _coerce_float(row.get("CMF20"))
-    obv_slope10 = _coerce_float(row.get("OBVSlope10"))
-    macd_hist = _coerce_float(row.get("MACDHist"))
-    macd_delta = _coerce_float(row.get("MACDHistDelta"))
-    macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
-    macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
-    bb_pos = _coerce_float(row.get("BBPos20"))
-    bb_width_pct = _coerce_float(row.get("BBWidthPct"))
-    volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
-    volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
-    close_value = _coerce_float(row.get("Close"))
-    open_value = _coerce_float(row.get("Open"))
-    ema20 = _coerce_float(row.get("EMA20"))
-    ema50 = _coerce_float(row.get("EMA50"))
-    stop_touched = _coerce_bool(row.get("StopTouched"))
-    stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
-    sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
-    heat_trim_confluence, heat_trim_extreme = detect_heat_trim_confluence(row)
-    ma_overheat = bool(
-        close_value is not None
-        and ema20 is not None
-        and ema50 is not None
-        and close_value >= ema20
-        and ema20 >= ema50
-    )
-    sell_rsi_hot = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_hot"])
-    sell_rsi_extreme = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_extreme"])
-    sell_mfi_hot = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_hot"])
-    sell_mfi_extreme = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_extreme"])
-    sell_greed_hot = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_hot"])
-    sell_greed_extreme = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_extreme"])
-    sell_bb_hot = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_high"])
-    sell_bb_extreme = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_extreme"])
-    sell_cutoff_hits = int(sum([sell_rsi_hot, sell_mfi_hot, sell_greed_hot, sell_bb_hot]))
-    sell_extreme_hits = int(sum([sell_rsi_extreme, sell_mfi_extreme, sell_greed_extreme, sell_bb_extreme]))
-    panic_low = bool(
-        cycle_score is not None
-        and rsi is not None
-        and (
-            (cycle_score <= 15 and rsi <= 40)
-            or (cycle_score <= 25 and rsi <= 35)
-        )
-    )
-    tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
-    accumulation_support = bool(
-        (cmf20 is not None and cmf20 >= 0.05 and obv_slope10 is not None and obv_slope10 > 0)
-        or volume_climax_up
-    )
-    blowoff_risk = bool(
-        volume_climax_up
-        and bb_pos is not None
-        and bb_pos >= 0.90
-        and (
-            (rsi is not None and rsi >= 66)
-            or (atr_stretch is not None and atr_stretch >= 1.1)
-        )
-    )
-    chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
-
-    exhaustion_score = 0.0
-    if cycle_score is not None:
-        if cycle_score >= 85:
-            exhaustion_score += 16
-            reasons.append("STL overheated")
-        elif cycle_score >= 72:
-            exhaustion_score += 12
-            reasons.append("STL extended")
-        elif cycle_score >= 60:
-            exhaustion_score += 7
-            reasons.append("STL rich")
-    score += weighted_component(exhaustion_score, SELL_COMPONENT_WEIGHTS["exhaustion"])
-
-    td_score = 0.0
-    if sell_countdown == 13:
-        td_score = 18
-        reasons.append("TD sell countdown 13")
-    elif sell_setup >= 9:
-        td_score = 12
-        reasons.append(f"TD sell setup {sell_setup}")
-    elif sell_setup >= 7:
-        td_score = 8
-        reasons.append(f"TD sell setup {sell_setup}")
-    score += weighted_component(td_score, SELL_COMPONENT_WEIGHTS["td"])
-
-    heat_score = 0.0
-    heat_signal = False
-    if atr_stretch is not None:
-        if atr_stretch >= 1.8:
-            heat_score += 12
-            heat_signal = True
-            reasons.append("ATR overextension")
-        elif atr_stretch >= 1.1:
-            heat_score += 8
-            heat_signal = True
-            reasons.append("ATR stretched")
-        elif atr_stretch >= 0.7:
-            heat_score += 4
-
-    if sell_rsi_extreme:
-        heat_score += 10 if (ma_overheat or bear_regime) else 5
-        heat_signal = True
-        reasons.append("RSI overheated")
-    elif sell_rsi_hot:
-        heat_score += 6 if (ma_overheat or bear_regime) else 3
-        heat_signal = True
+    if _coerce_bool(row_get(row, "SellConfirmRSI")):
         reasons.append("RSI hot")
-
-    if sell_mfi_extreme:
-        heat_score += 8 if (ma_overheat or bear_regime) else 4
-        heat_signal = True
-        reasons.append("MFI euphoric")
-    elif sell_mfi_hot:
-        heat_score += 4 if (ma_overheat or bear_regime) else 2
-        heat_signal = True
-        reasons.append("MFI rich")
-
-    if sell_bb_extreme:
-        heat_score += 8 if (ma_overheat or bear_regime) else 4
-        heat_signal = True
-        reasons.append("Bollinger upper-tag")
-    elif sell_bb_hot:
-        heat_score += 4 if (ma_overheat or bear_regime) else 2
-        heat_signal = True
-        reasons.append("Bollinger hot-zone")
-
-    if heat_trim_confluence:
-        heat_score += 8 if heat_trim_extreme else 5
-        heat_signal = True
-        reasons.append("Fear/RSI/MA trim cluster")
-
-    heat_score = min(18.0, heat_score)
-    score += weighted_component(heat_score, SELL_COMPONENT_WEIGHTS["heat"])
-
-    distribution_score = 0.0
-    distribution_flow = bool(
-        (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value < open_value)
-        or (mfi_change is not None and mfi_change <= -5.0 and mfi is not None and mfi >= 60.0)
-        or volume_climax_down
-        or (
-            cmf20 is not None
-            and cmf20 <= -0.05
-            and obv_slope10 is not None
-            and obv_slope10 < 0
-        )
-    )
-    if distribution_flow:
-        distribution_score += 8
+    if _coerce_bool(row_get(row, "SellConfirmFear")):
+        reasons.append("Greed high")
+    if _coerce_bool(row_get(row, "SellConfirmTD")):
+        reasons.append("TD sell exhaustion")
+    if _coerce_bool(row_get(row, "SellConfirmMACD")):
+        reasons.append("MACD bear")
+    if _coerce_bool(row_get(row, "SellConfirmDistribution")):
         reasons.append("Distribution flow")
-    if blowoff_risk:
-        distribution_score += 6
-        reasons.append("Blowoff volume")
-    if sell_greed_extreme:
-        distribution_score += 8 if (ma_overheat or bear_regime) else 3
-        reasons.append("Macro greed risk")
-    elif sell_greed_hot:
-        distribution_score += 4 if (ma_overheat or bear_regime) else 1
-        reasons.append("Macro greed warning")
-    if tips_risk_off:
-        if tips_momentum is not None and tips_momentum <= -0.03:
-            distribution_score += 8
-            reasons.append("TIPS 13612W negative")
-        else:
-            distribution_score += 5
-            reasons.append("TIPS risk-off backdrop")
-    if rs_percentile is not None and rs_percentile <= 25:
-        distribution_score += 8
-        reasons.append("Relative strength breakdown")
-    elif rs_percentile is not None and rs_percentile <= 40:
-        distribution_score += 4
-    if rs_momentum is not None and rs_momentum <= -0.03:
-        distribution_score += 6
-    if macd_bear_cross:
-        distribution_score += 10 if macd_hist is not None and macd_hist >= 0 else 8
-        reasons.append("MACD bear cross")
-    elif macd_delta is not None:
-        if macd_delta < 0 and macd_hist is not None and macd_hist <= 0:
-            distribution_score += 8
-            reasons.append("MACD breakdown")
-        elif macd_delta < 0 and macd_hist is not None and macd_hist > 0:
-            distribution_score += 4
-            reasons.append("MACD rollover")
-    if macd_bull_cross and bull_regime and not stop_close_breach:
-        distribution_score -= 6
-        reasons.append("MACD support")
-    if sell_trigger_price:
-        distribution_score += 12
-        reasons.append("Price breakdown")
-    if stop_close_breach:
-        distribution_score += 10 if reference_asset and panic_low else 16
-        reasons.append("Trailing stop close breach")
-    elif stop_touched:
-        distribution_score += 4
-        reasons.append("Intraday stop probe")
-    if bear_regime:
-        distribution_score += 12
-        reasons.append("Bear regime pressure")
-    if accumulation_support and not stop_close_breach and not bear_regime:
-        distribution_score -= 6
-        reasons.append("Accumulation support")
-    if chop_zone:
-        if distribution_flow or macd_bear_cross or stop_close_breach:
-            distribution_score += 3
-            reasons.append("Squeeze breakdown risk")
-        else:
-            distribution_score -= 7
-            reasons.append("Bollinger squeeze chop")
-    score += weighted_component(distribution_score, SELL_COMPONENT_WEIGHTS["distribution"])
-
-    confluence_count = int(sum(
-        [
-            bool(cycle_score is not None and cycle_score >= 72),
-            bool(sell_setup >= 8 or sell_countdown == 13),
-            heat_signal,
-            distribution_flow,
-            sell_trigger_price,
-            stop_close_breach,
-            bear_regime,
-            macd_bear_cross or sell_cutoff_hits >= 2,
-            heat_trim_confluence,
-        ]
-    ))
-    if confluence_count >= 3:
-        confluence_bonus = min(16.0, 5.0 + ((confluence_count - 3) * 3.0))
-        score += weighted_component(confluence_bonus, SELL_COMPONENT_WEIGHTS["confluence"])
-        reasons.append(f"{confluence_count}x sell confluence")
-    if sell_extreme_hits >= 2:
-        score += weighted_component(6.0, SELL_COMPONENT_WEIGHTS["confluence"])
-        reasons.append("Extreme hot cutoffs")
-    elif sell_cutoff_hits >= 3:
-        score += weighted_component(4.0, SELL_COMPONENT_WEIGHTS["confluence"])
-        reasons.append("Multi-cutoff heat")
-
-    if bull_regime and not stop_close_breach and not sell_trigger_price:
-        score = min(score, 56.0 if sell_cutoff_hits < 2 else 62.0)
-        if rs_percentile is not None and rs_percentile >= 55:
-            score -= 6
-        reasons.append("Bull trend trim bias")
-
-    if reference_asset and panic_low and not stop_close_breach and not sell_trigger_price:
-        score = min(score, 32.0)
-        reasons.append("Capitulation sell cap")
-
-    return max(0, min(100, int(round(score)))), reasons[:5]
+    if _coerce_bool(row_get(row, "SellConfirmATR")):
+        reasons.append("ATR hot")
+    if _coerce_bool(row_get(row, "SellMACrossDown")):
+        reasons.append("EMA bear cross")
+    elif _coerce_bool(row_get(row, "SellMALoseFast")):
+        reasons.append("Lost fast EMA")
+    if _coerce_bool(row_get(row, "StopExitConfirmed")):
+        reasons.append("Stop confirmed")
+    return reasons[:5]
 
 
-def build_signal_state(row: Any, preset: SignalPreset) -> dict[str, Any]:
-    buy_score, buy_reasons = score_buy_signal(row)
-    sell_score, sell_reasons = score_sell_signal(row)
-    regime = classify_market_regime(row)
-    bull_regime = _is_bull_regime(regime)
-    bear_regime = _is_bear_regime(regime)
-    reference_asset = _coerce_bool(row.get("ReferenceAsset"))
-
-    close_value = _coerce_float(row.get("Close"))
-    open_value = _coerce_float(row.get("Open"))
-    cycle_score = _coerce_float(row.get("CycleScore"))
-    rsi = _coerce_float(row.get("RSI"))
-    mfi = _coerce_float(row.get("MFI"))
-    buy_countdown = int(row.get("BuyCountdown", 0) or 0)
-    fear_greed = _coerce_float(row.get("FearGreed"))
-    tips_momentum = _coerce_float(row.get("TIPS13612WMomentum"))
-    rs_percentile = _coerce_float(row.get("RSPercentile"))
-    volume_ratio = _coerce_float(row.get("VolumeRatio20"))
-    cmf20 = _coerce_float(row.get("CMF20"))
-    obv_slope10 = _coerce_float(row.get("OBVSlope10"))
-    mfi_change = _coerce_float(row.get("MFIChange5"))
-    macd_delta = _coerce_float(row.get("MACDHistDelta"))
-    macd_bull_cross = _coerce_bool(row.get("MACDBullCross"))
-    macd_bear_cross = _coerce_bool(row.get("MACDBearCross"))
-    bb_pos = _coerce_float(row.get("BBPos20"))
-    bb_width_pct = _coerce_float(row.get("BBWidthPct"))
-    volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp"))
-    volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown"))
-    volume_dry_up = _coerce_bool(row.get("VolumeDryUp"))
-    stop_touched = _coerce_bool(row.get("StopTouched"))
-    stop_close_breach = _coerce_bool(row.get("StopCloseBreach"))
-    stop_price = _coerce_float(row.get("ChandelierStop"))
-    atr_value = _coerce_float(row.get("ATR"))
-    buy_trigger_price = _coerce_bool(row.get("BuyTriggerPrice"))
-    sell_trigger_price = _coerce_bool(row.get("SellTriggerPrice"))
-    close_up_day = _coerce_bool(row.get("CloseUpDay"))
-    close_down_day = _coerce_bool(row.get("CloseDownDay"))
-    buy_rsi_cutoff = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
-    buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
-    buy_mfi_cutoff = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
-    buy_mfi_extreme = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_extreme"])
-    buy_fear_cutoff = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_reset"])
-    buy_fear_extreme = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_extreme"])
-    buy_bb_cutoff = bool(bb_pos is not None and bb_pos <= BUY_CUTOFFS["bb_low"])
-    buy_bb_extreme = bool(bb_pos is not None and bb_pos <= 0.10)
-    buy_cutoff_hits = int(sum([buy_rsi_cutoff, buy_mfi_cutoff, buy_fear_cutoff, buy_bb_cutoff]))
-    buy_extreme_hits = int(sum([buy_rsi_extreme, buy_mfi_extreme, buy_fear_extreme, buy_bb_extreme]))
-    sell_rsi_cutoff = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_hot"])
-    sell_rsi_extreme = bool(rsi is not None and rsi >= SELL_CUTOFFS["rsi_extreme"])
-    sell_mfi_cutoff = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_hot"])
-    sell_mfi_extreme = bool(mfi is not None and mfi >= SELL_CUTOFFS["mfi_extreme"])
-    sell_greed_cutoff = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_hot"])
-    sell_greed_extreme = bool(fear_greed is not None and fear_greed >= SELL_CUTOFFS["greed_extreme"])
-    sell_bb_cutoff = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_high"])
-    sell_bb_extreme = bool(bb_pos is not None and bb_pos >= SELL_CUTOFFS["bb_extreme"])
-    sell_cutoff_hits = int(sum([sell_rsi_cutoff, sell_mfi_cutoff, sell_greed_cutoff, sell_bb_cutoff]))
-    sell_extreme_hits = int(sum([sell_rsi_extreme, sell_mfi_extreme, sell_greed_extreme, sell_bb_extreme]))
-    deep_value_confluence, deep_value_extreme = detect_deep_value_confluence(row)
-    heat_trim_confluence, heat_trim_extreme = detect_heat_trim_confluence(row)
-    macro_trend_exit = detect_macro_trend_exit(row)
-
-    deep_reversal = bool(cycle_score is not None and cycle_score <= 15 and buy_countdown == 13)
-    panic_low = bool(
-        cycle_score is not None
-        and rsi is not None
-        and (
-            (cycle_score <= 15 and rsi <= 40)
-            or (cycle_score <= 25 and rsi <= 35)
-        )
-    )
-    dryup_reversal = bool(
-        volume_dry_up
-        and cycle_score is not None
-        and cycle_score <= 25
-        and rsi is not None
-        and rsi <= 44
-    )
-    accumulation_flow = bool(
-        volume_climax_up
-        or (
-            cmf20 is not None
-            and cmf20 >= 0.03
-            and obv_slope10 is not None
-            and obv_slope10 > 0
-        )
-    )
-    distribution_flow = bool(
-        volume_climax_down
-        or (
-            cmf20 is not None
-            and cmf20 <= -0.03
-            and obv_slope10 is not None
-            and obv_slope10 < 0
-        )
-    )
-    flow_conflict = distribution_flow and not accumulation_flow
-    volume_support = bool(
-        (volume_ratio is not None and volume_ratio >= 1.05 and close_value is not None and open_value is not None and close_value >= open_value)
-        or (mfi_change is not None and mfi_change >= 5.0)
-        or accumulation_flow
-        or dryup_reversal
-    )
-    relative_support = bool(rs_percentile is not None and rs_percentile >= (40.0 if reference_asset else 50.0))
-    bullish_close = bool(close_value is not None and open_value is not None and close_value >= open_value)
-    tips_risk_off = bool(tips_momentum is not None and tips_momentum < 0.0)
-    chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
-    reference_washout = bool(
-        reference_asset
-        and cycle_score is not None
-        and cycle_score <= 30
-        and buy_cutoff_hits >= 1
-    )
-    strong_trend_dip = bool(
-        bull_regime
-        and cycle_score is not None
-        and cycle_score <= 38
-        and (buy_cutoff_hits >= 1 or cycle_score <= 25)
-        and volume_support
-        and (macd_bull_cross or buy_trigger_price)
-        and not flow_conflict
-    )
-    buy_cutoff_ready = bool(
-        deep_reversal
-        or reference_washout
-        or buy_extreme_hits >= 1
-        or (cycle_score is not None and cycle_score <= 35 and buy_cutoff_hits >= 1)
-        or (
-            cycle_score is not None
-            and cycle_score <= 45
-            and buy_cutoff_hits >= 2
-            and (volume_support or macd_bull_cross or bull_regime)
-        )
-        or strong_trend_dip
-        or deep_value_confluence
-    )
-    sell_capitulation_block = bool(
-        deep_reversal
-        or deep_value_extreme
-        or buy_extreme_hits >= 2
-        or (cycle_score is not None and cycle_score <= 30 and buy_cutoff_hits >= 2)
-    )
-    sell_cutoff_ready = bool(
-        sell_trigger_price
-        or sell_extreme_hits >= 2
-        or (stop_close_breach and not sell_capitulation_block)
-        or (
-            bull_regime
-            and cycle_score is not None
-            and cycle_score >= 72
-            and sell_cutoff_hits >= 2
-            and (distribution_flow or macd_bear_cross or tips_risk_off or stop_touched)
-        )
-        or (
-            not bull_regime
-            and cycle_score is not None
-            and cycle_score >= 68
-            and sell_cutoff_hits >= 1
-            and (distribution_flow or macd_bear_cross or bear_regime or tips_risk_off or stop_touched)
-        )
-    )
-
-    buy_setup_threshold = preset.watch_threshold
-    if bull_regime and relative_support:
-        buy_setup_threshold -= 3
-    if reference_asset:
-        buy_setup_threshold -= 5
-    if buy_cutoff_hits >= 2 or deep_reversal:
-        buy_setup_threshold -= 2
-    if deep_value_confluence:
-        buy_setup_threshold -= 4
-    if tips_risk_off and not deep_reversal:
-        buy_setup_threshold += 2
-    if chop_zone and not (macd_bull_cross or accumulation_flow or deep_reversal):
-        buy_setup_threshold += 3
-    if flow_conflict and not deep_reversal:
-        buy_setup_threshold += 4
-    buy_setup_active = (
-        (
-            buy_score >= buy_setup_threshold
-            and buy_cutoff_ready
-            and (buy_score >= sell_score - 8 or deep_reversal)
-        )
-        or reference_washout
-        or strong_trend_dip
-    )
-    sell_setup_threshold = preset.watch_threshold + (4 if reference_asset else 0)
-    if sell_cutoff_hits == 0 and not stop_close_breach and not sell_trigger_price:
-        sell_setup_threshold += 4
-    if chop_zone and not (macd_bear_cross or distribution_flow or stop_close_breach):
-        sell_setup_threshold += 3
-    sell_setup_active = bool(
-        (not sell_capitulation_block)
-        and (
-            stop_close_breach
-            or (sell_score >= sell_setup_threshold and sell_cutoff_ready and sell_score >= buy_score - 2 and not panic_low)
-        )
-    )
-    stop_exit_confirmed, stop_emergency_exit, stop_gap_atr = evaluate_stop_exit(
-        close_value,
-        stop_price,
-        atr_value,
-        sell_score=sell_score,
-        buy_score=buy_score,
-        bearish_context=bear_regime,
-        sell_context=bool(sell_setup_active or sell_trigger_price),
-        hold_lock_active=False,
-        macro_risk_off=tips_risk_off,
-    )
-    buy_trigger = bool(
-        buy_setup_active
-        and not stop_exit_confirmed
-        and (buy_cutoff_ready or strong_trend_dip)
-        and (not chop_zone or macd_bull_cross or accumulation_flow or deep_reversal or buy_trigger_price)
-        and (not flow_conflict or deep_reversal or macd_bull_cross)
-        and (
-            buy_trigger_price
-            or macd_bull_cross
-            or (deep_reversal and bullish_close and (volume_support or relative_support))
-            or (
-                close_up_day
-                and buy_score >= max(preset.watch_threshold + 4, sell_score + 6)
-                and (
-                    accumulation_flow
-                    or (volume_support and not flow_conflict)
-                    or deep_reversal
-                    or bull_regime
-                    or (macd_delta is not None and macd_delta > 0)
-                )
-            )
-            or (bull_regime and buy_score >= max(preset.watch_threshold, preset.strong_threshold - 8) and bullish_close and volume_support and not flow_conflict)
-            or (deep_value_confluence and (buy_trigger_price or macd_bull_cross or close_up_day))
-        )
-    )
-    sell_trigger = bool(
-        stop_emergency_exit
-        or (
-            sell_setup_active
-            and sell_cutoff_ready
-            and (not chop_zone or macd_bear_cross or distribution_flow or stop_exit_confirmed or sell_trigger_price)
-            and (
-                stop_exit_confirmed
-                or sell_trigger_price
-                or macd_bear_cross
-                or (close_down_day and sell_score >= max(preset.watch_threshold + 6, buy_score + 8) and bear_regime)
-            )
-        )
-    )
-    trim_ready = bool(
-        sell_setup_active
-        and sell_cutoff_ready
-        and not sell_capitulation_block
-        and not sell_trigger
-        and not stop_exit_confirmed
-        and (not chop_zone or macd_bear_cross or distribution_flow)
-        and (
-            bull_regime
-            or (rs_percentile is not None and rs_percentile >= 50.0)
-            or sell_greed_cutoff
-            or heat_trim_confluence
-        )
-    )
-
-    buy_strong_threshold = preset.strong_threshold - 5 if bull_regime and relative_support else preset.strong_threshold
-    sell_strong_threshold = preset.strong_threshold + 6 if bull_regime and not stop_exit_confirmed else preset.strong_threshold
-
-    if stop_emergency_exit:
-        state = "Strong Sell"
-        key_reasons = sell_reasons
-    elif reference_asset and panic_low and buy_setup_active and not sell_trigger:
-        if buy_trigger and buy_score >= preset.strong_threshold - 6:
-            state = "Strong Buy"
-        elif buy_trigger or buy_score >= preset.watch_threshold + 2:
-            state = "Buy"
-        else:
-            state = "Weak Buy"
-        key_reasons = buy_reasons
-    elif sell_trigger and (stop_emergency_exit or sell_score >= max(sell_strong_threshold, buy_score + 4)):
-        state = "Strong Sell"
-        key_reasons = sell_reasons
-    elif sell_trigger and sell_score >= max(preset.watch_threshold + 8, buy_score + 6):
-        state = "Sell"
-        key_reasons = sell_reasons
-    elif buy_trigger and buy_score >= max(preset.watch_threshold + 10, buy_strong_threshold) and buy_score >= sell_score - 3:
-        state = "Strong Buy"
-        key_reasons = buy_reasons
-    elif buy_trigger and buy_score >= max(preset.watch_threshold + 2, sell_score):
-        state = "Buy"
-        key_reasons = buy_reasons
-    elif buy_setup_active:
-        state = "Weak Buy"
-        key_reasons = buy_reasons
-    elif trim_ready or (sell_setup_active and sell_score > buy_score + 2):
-        state = "Weak Sell"
-        key_reasons = sell_reasons
-    else:
-        state = "Hold / Neutral"
-        key_reasons = buy_reasons[:2] + sell_reasons[:2]
-
-    if bull_regime and heat_trim_confluence and not macro_trend_exit and state in {"Strong Sell", "Sell"}:
-        state = "Weak Sell"
-        sell_trigger = False
-        key_reasons = sell_reasons
-
-    td_label = str(row.get("TDLabel", "Unavailable"))
-    cycle_text = f"Cycle {_format_float(cycle_score, 1)}" if cycle_score is not None else "Cycle n/a"
-    fear_text = f"Fear & Greed {_format_float(fear_greed, 0)}" if fear_greed is not None else "Fear & Greed n/a"
-    reason_text = ", ".join(key_reasons[:3]) if key_reasons else "No dominant edge"
-    note = (
-        f"{state} | {regime} | B{buy_score}/S{sell_score} | "
-        f"Setup {int(buy_setup_active)}/{int(sell_setup_active)} | Trigger {int(buy_trigger)}/{int(sell_trigger)} | "
-        f"{cycle_text} | {td_label} | {fear_text} | {reason_text}"
-    )
-
-    return {
-        "State": state,
-        "Regime": regime,
-        "BuyScore": buy_score,
-        "SellScore": sell_score,
-        "BuySetupActive": buy_setup_active,
-        "SellSetupActive": sell_setup_active,
-        "BuyTrigger": buy_trigger,
-        "SellTrigger": sell_trigger,
-        "StopExitConfirmed": stop_exit_confirmed,
-        "StopEmergencyExit": stop_emergency_exit,
-        "StopGapATR": stop_gap_atr,
-        "SignalNote": note,
-        "BuyReasonText": " | ".join(buy_reasons),
-        "SellReasonText": " | ".join(sell_reasons),
-        "DeepValueConfluence": deep_value_confluence,
-        "DeepValueExtreme": deep_value_extreme,
-        "HeatTrimConfluence": heat_trim_confluence,
-        "HeatTrimExtreme": heat_trim_extreme,
-        "MacroTrendExit": macro_trend_exit,
-    }
-
-
-def _compose_signal_note(row: pd.Series, state: str) -> str:
-    buy_score = int(row.get("BuyScore", 0) or 0)
-    sell_score = int(row.get("SellScore", 0) or 0)
-    regime = str(row.get("Regime", "n/a"))
-    td_label = str(row.get("TDLabel", "Unavailable"))
-    cycle_score = _coerce_float(row.get("CycleScore"))
-    fear_greed = _coerce_float(row.get("FearGreed"))
-    if state in {"Strong Buy", "Buy", "Weak Buy"}:
-        reason_source = str(row.get("BuyReasonText", ""))
-    elif state in {"Strong Sell", "Sell", "Weak Sell"}:
-        reason_source = str(row.get("SellReasonText", ""))
-    else:
-        neutral_parts = [str(row.get("BuyReasonText", "")).split(" | ")[0], str(row.get("SellReasonText", "")).split(" | ")[0]]
-        reason_source = " | ".join(part for part in neutral_parts if part)
-    reason_parts = [part for part in reason_source.split(" | ") if part][:3]
+def _compose_signal_note(row: Any, state: str) -> str:
+    buy_score = int(row_get(row, "BuyScore", 0) or 0)
+    sell_score = int(row_get(row, "SellScore", 0) or 0)
+    regime = str(row_get(row, "Regime", "n/a"))
+    td_label = str(row_get(row, "TDLabel", "Unavailable"))
+    cycle_score = _coerce_float(row_get(row, "CycleScore"))
+    fear_greed = _coerce_float(row_get(row, "FearGreed"))
+    reason_parts = _build_buy_reason_parts(row) if state in {"Strong Buy", "Buy", "Weak Buy"} else _build_sell_reason_parts(row)
+    if state == "Hold / Neutral":
+        reason_parts = (_build_buy_reason_parts(row)[:1] + _build_sell_reason_parts(row)[:1])[:2]
     cycle_text = f"Cycle {_format_float(cycle_score, 1)}" if cycle_score is not None else "Cycle n/a"
     fear_text = f"Fear & Greed {_format_float(fear_greed, 0)}" if fear_greed is not None else "Fear & Greed n/a"
     reason_text = ", ".join(reason_parts) if reason_parts else "No dominant edge"
     return (
         f"{state} | {regime} | B{buy_score}/S{sell_score} | "
-        f"Setup {int(_coerce_bool(row.get('BuySetupWindow', row.get('BuySetupActive', False))))}/"
-        f"{int(_coerce_bool(row.get('SellSetupWindow', row.get('SellSetupActive', False))))} | "
-        f"Trigger {int(_coerce_bool(row.get('BuyTrigger', False)))}/{int(_coerce_bool(row.get('SellTrigger', False)))} | "
+        f"Setup {int(_coerce_bool(row_get(row, 'BuySetupActive')))}/{int(_coerce_bool(row_get(row, 'SellSetupActive')))} | "
+        f"Trigger {int(_coerce_bool(row_get(row, 'BuyTrigger')))}/{int(_coerce_bool(row_get(row, 'SellTrigger')))} | "
         f"{cycle_text} | {td_label} | {fear_text} | {reason_text}"
     )
 
 
-def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
+def build_state_frame(
+    indicator_frame: pd.DataFrame,
+    preset: SignalPreset,
+    config: RuleStrategyConfig | None = None,
+    *,
+    include_notes: bool = True,
+) -> pd.DataFrame:
+    strategy = config or DEFAULT_RULE_CONFIG
     frame = indicator_frame.dropna(subset=["Close"]).copy()
     if frame.empty:
         return frame
 
-    min_hold_bars = preset_min_hold_bars(preset)
-    reentry_lock_bars = preset_reentry_lock_bars(preset)
-    state_rows = [build_signal_state(TupleRowAccessor(row), preset) for row in frame.itertuples(index=False, name="IndicatorRow")]
-    state_frame = frame.join(pd.DataFrame(state_rows, index=frame.index), how="left")
-    setup_window = max(3, min(6, preset.cooldown_bars + 1))
-    state_frame["BuySetupWindow"] = state_frame["BuySetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
-    state_frame["SellSetupWindow"] = state_frame["SellSetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
-    state_frame["BuySetupPeakScore"] = state_frame["BuyScore"].where(state_frame["BuySetupActive"]).rolling(setup_window, min_periods=1).max()
-    state_frame["SellSetupPeakScore"] = state_frame["SellScore"].where(state_frame["SellSetupActive"]).rolling(setup_window, min_periods=1).max()
+    fast_col = ema_column(strategy.fast_ema)
+    slow_col = ema_column(strategy.slow_ema)
+    if fast_col not in frame.columns or slow_col not in frame.columns:
+        return pd.DataFrame(index=frame.index)
 
-    updated_buy_trigger: list[bool] = []
-    updated_sell_trigger: list[bool] = []
-    updated_state: list[str] = []
-    hold_lock_flags: list[bool] = []
-    reentry_lock_flags: list[bool] = []
-    updated_stop_exit_confirmed: list[bool] = []
-    updated_stop_emergency_exit: list[bool] = []
-    updated_stop_gap_atr: list[float | None] = []
+    regime_series = frame.apply(classify_market_regime, axis=1)
+    fast_ema = pd.to_numeric(frame[fast_col], errors="coerce")
+    slow_ema = pd.to_numeric(frame[slow_col], errors="coerce")
+    fast_slope = fast_ema - fast_ema.shift(3)
+    slow_slope = slow_ema - slow_ema.shift(5)
+    reference_threshold = np.where(frame["ReferenceAsset"].fillna(False), 40.0, 50.0)
+    rs_support = pd.to_numeric(frame.get("RSPercentile"), errors="coerce").ge(reference_threshold) | pd.to_numeric(frame.get("RSMomentum63"), errors="coerce").ge(-0.02)
+    accumulation = frame["VolumeClimaxUp"].fillna(False) | (
+        pd.to_numeric(frame["CMF20"], errors="coerce").ge(0.03) & pd.to_numeric(frame["OBVSlope10"], errors="coerce").gt(0.0)
+    )
+    distribution = frame["VolumeClimaxDown"].fillna(False) | (
+        pd.to_numeric(frame["CMF20"], errors="coerce").le(-0.03) & pd.to_numeric(frame["OBVSlope10"], errors="coerce").lt(0.0)
+    )
+    volume_reset = frame["VolumeDryUp"].fillna(False) | (
+        pd.to_numeric(frame["VolumeRatio20"], errors="coerce").ge(1.05) & frame["Close"].ge(frame["Open"])
+    )
+    bottom_rsi = pd.to_numeric(frame["RSI"], errors="coerce").le(BUY_CUTOFFS["rsi_reset"])
+    bottom_stl = pd.to_numeric(frame["CycleScore"], errors="coerce").le(25.0)
+    bottom_fear = pd.to_numeric(frame["FearGreed"], errors="coerce").le(BUY_CUTOFFS["fear_reset"])
+    buy_td = pd.to_numeric(frame["BuySetup"], errors="coerce").ge(8) | pd.to_numeric(frame["BuyCountdown"], errors="coerce").eq(13)
+    sell_td = pd.to_numeric(frame["SellSetup"], errors="coerce").ge(8) | pd.to_numeric(frame["SellCountdown"], errors="coerce").eq(13)
+    buy_macd = frame["MACDBullCross"].fillna(False) | (
+        pd.to_numeric(frame["MACDHistDelta"], errors="coerce").gt(0.0) & pd.to_numeric(frame["MACDHist"], errors="coerce").le(0.12)
+    )
+    sell_macd = frame["MACDBearCross"].fillna(False) | (
+        pd.to_numeric(frame["MACDHistDelta"], errors="coerce").lt(0.0) & pd.to_numeric(frame["MACDHist"], errors="coerce").ge(-0.12)
+    )
+    buy_ma_cross = (fast_ema > slow_ema) & (fast_ema.shift(1) <= slow_ema.shift(1))
+    buy_ma_reclaim = frame["Close"].gt(fast_ema) & frame["Close"].shift(1).le(fast_ema.shift(1)) & fast_slope.gt(0)
+    sell_ma_cross = (fast_ema < slow_ema) & (fast_ema.shift(1) >= slow_ema.shift(1))
+    sell_ma_reclaim = frame["Close"].lt(fast_ema) & frame["Close"].shift(1).ge(fast_ema.shift(1)) & slow_slope.lt(0)
+
+    frame["Regime"] = regime_series
+    frame["ConfigHash"] = strategy.config_hash()
+    frame["ConfigFastEMA"] = fast_ema
+    frame["ConfigSlowEMA"] = slow_ema
+    frame["ConfigFastSpan"] = strategy.fast_ema
+    frame["ConfigSlowSpan"] = strategy.slow_ema
+    frame["BottomRSILow"] = bottom_rsi.fillna(False)
+    frame["BottomSTLLow"] = bottom_stl.fillna(False)
+    frame["BottomFearLow"] = bottom_fear.fillna(False)
+    frame["BottomVotes"] = _sum_bool_columns(frame, ["BottomRSILow", "BottomSTLLow", "BottomFearLow"])
+    frame["BuyConfirmMFI"] = pd.to_numeric(frame["MFI"], errors="coerce").le(BUY_CUTOFFS["mfi_reset"]).fillna(False)
+    frame["BuyConfirmATR"] = pd.to_numeric(frame["ATRStretch"], errors="coerce").le(-0.85).fillna(False)
+    frame["BuyConfirmBB"] = pd.to_numeric(frame["BBPos20"], errors="coerce").le(BUY_CUTOFFS["bb_low"]).fillna(False)
+    frame["BuyConfirmTD"] = buy_td.fillna(False)
+    frame["BuyConfirmMACD"] = buy_macd.fillna(False)
+    frame["BuyConfirmAccumulation"] = accumulation.fillna(False)
+    frame["BuyConfirmRelative"] = rs_support.fillna(False)
+    frame["BuyConfirmVolumeReset"] = volume_reset.fillna(False)
+    frame["BuyMACrossUp"] = buy_ma_cross.fillna(False)
+    frame["BuyMAReclaim"] = buy_ma_reclaim.fillna(False)
+    frame["BuyConfirmationVotes"] = _sum_bool_columns(
+        frame,
+        [
+            "BuyConfirmMFI",
+            "BuyConfirmATR",
+            "BuyConfirmBB",
+            "BuyConfirmTD",
+            "BuyConfirmMACD",
+            "BuyConfirmAccumulation",
+            "BuyConfirmRelative",
+            "BuyConfirmVolumeReset",
+        ],
+    )
+    frame["SellConfirmRSI"] = pd.to_numeric(frame["RSI"], errors="coerce").ge(SELL_CUTOFFS["rsi_hot"]).fillna(False)
+    frame["SellConfirmFear"] = pd.to_numeric(frame["FearGreed"], errors="coerce").ge(SELL_CUTOFFS["greed_hot"]).fillna(False)
+    frame["SellConfirmTD"] = sell_td.fillna(False)
+    frame["SellConfirmMACD"] = sell_macd.fillna(False)
+    frame["SellConfirmDistribution"] = distribution.fillna(False)
+    frame["SellConfirmATR"] = pd.to_numeric(frame["ATRStretch"], errors="coerce").ge(0.95).fillna(False)
+    frame["SellConfirmBB"] = pd.to_numeric(frame["BBPos20"], errors="coerce").ge(SELL_CUTOFFS["bb_high"]).fillna(False)
+    frame["SellMACrossDown"] = sell_ma_cross.fillna(False)
+    frame["SellMALoseFast"] = sell_ma_reclaim.fillna(False)
+    frame["SellConfirmationVotes"] = _sum_bool_columns(
+        frame,
+        [
+            "SellConfirmRSI",
+            "SellConfirmFear",
+            "SellConfirmTD",
+            "SellConfirmMACD",
+            "SellConfirmDistribution",
+            "SellConfirmATR",
+            "SellConfirmBB",
+        ],
+    )
+    frame["SellCapitulationBlock"] = (
+        frame["BottomVotes"].ge(2)
+        & (pd.to_numeric(frame["CycleScore"], errors="coerce").le(30.0) | pd.to_numeric(frame["RSI"], errors="coerce").le(35.0))
+    ).fillna(False)
+
+    buy_score = (
+        np.where(frame["BottomRSILow"], 16.0, 0.0)
+        + np.where(pd.to_numeric(frame["RSI"], errors="coerce").le(BUY_CUTOFFS["rsi_extreme"]), 6.0, 0.0)
+        + np.where(frame["BottomSTLLow"], 18.0, 0.0)
+        + np.where(pd.to_numeric(frame["CycleScore"], errors="coerce").le(12.0), 6.0, 0.0)
+        + np.where(frame["BottomFearLow"], 14.0, 0.0)
+        + np.where(pd.to_numeric(frame["FearGreed"], errors="coerce").le(BUY_CUTOFFS["fear_extreme"]), 6.0, 0.0)
+        + np.where(frame["BuyConfirmMFI"], 7.0, 0.0)
+        + np.where(pd.to_numeric(frame["MFI"], errors="coerce").le(BUY_CUTOFFS["mfi_extreme"]), 3.0, 0.0)
+        + np.where(frame["BuyConfirmATR"], 8.0, 0.0)
+        + np.where(frame["BuyConfirmBB"], 7.0, 0.0)
+        + np.where(frame["BuyConfirmTD"], 9.0, 0.0)
+        + np.where(frame["BuyConfirmMACD"], 10.0, 0.0)
+        + np.where(frame["BuyConfirmAccumulation"], 8.0, 0.0)
+        + np.where(frame["BuyConfirmRelative"], 6.0, 0.0)
+        + np.where(frame["BuyConfirmVolumeReset"], 6.0, 0.0)
+        + np.where(frame["BuyMACrossUp"], 10.0, 0.0)
+        + np.where(frame["BuyMAReclaim"], 6.0, 0.0)
+        + np.where(frame["BottomVotes"].ge(2), 8.0, 0.0)
+        + np.where(frame["BottomVotes"].eq(3), 6.0, 0.0)
+        + np.where(regime_series.isin({"Bull Trend", "Bull Pullback"}), 5.0, 0.0)
+    )
+    sell_score = (
+        np.where(frame["SellConfirmRSI"], 10.0, 0.0)
+        + np.where(pd.to_numeric(frame["RSI"], errors="coerce").ge(SELL_CUTOFFS["rsi_extreme"]), 5.0, 0.0)
+        + np.where(frame["SellConfirmFear"], 8.0, 0.0)
+        + np.where(pd.to_numeric(frame["FearGreed"], errors="coerce").ge(SELL_CUTOFFS["greed_extreme"]), 4.0, 0.0)
+        + np.where(frame["SellConfirmTD"], 8.0, 0.0)
+        + np.where(frame["SellConfirmMACD"], 9.0, 0.0)
+        + np.where(frame["SellConfirmDistribution"], 9.0, 0.0)
+        + np.where(frame["SellConfirmATR"], 8.0, 0.0)
+        + np.where(frame["SellConfirmBB"], 7.0, 0.0)
+        + np.where(frame["SellMACrossDown"], 10.0, 0.0)
+        + np.where(frame["SellMALoseFast"], 6.0, 0.0)
+        + np.where(regime_series.isin({"Bear Trend", "Bear Rally"}), 5.0, 0.0)
+    )
+    frame["BuyScore"] = np.clip(np.rint(buy_score), 0, 100).astype(int)
+    frame["SellScore"] = np.clip(np.rint(sell_score), 0, 100).astype(int)
+
+    buy_setup_active = (
+        frame["BottomVotes"].ge(strategy.bottom_required)
+        & frame["BuyConfirmationVotes"].ge(max(1, strategy.buy_confirmation_required - 1))
+        & pd.Series(frame["BuyScore"], index=frame.index).ge(max(strategy.buy_score_threshold - 8, 40))
+    )
+    sell_setup_active = (
+        ~frame["SellCapitulationBlock"]
+        & frame["SellConfirmationVotes"].ge(max(1, strategy.sell_confirmation_required - 1))
+        & pd.Series(frame["SellScore"], index=frame.index).ge(max(strategy.sell_score_threshold - 8, 40))
+    )
+    buy_trigger_candidate = (
+        buy_setup_active
+        & frame["BuyConfirmationVotes"].ge(strategy.buy_confirmation_required)
+        & (frame["BuyMACrossUp"] | (frame["BuyMAReclaim"] if strategy.allow_reclaim_trigger else False))
+    )
+    if strategy.require_macd_for_buy:
+        buy_trigger_candidate &= frame["BuyConfirmMACD"]
+    if strategy.require_volume_for_buy:
+        buy_trigger_candidate &= (frame["BuyConfirmAccumulation"] | frame["BuyConfirmVolumeReset"])
+    sell_trigger_candidate = (
+        sell_setup_active
+        & frame["SellConfirmationVotes"].ge(strategy.sell_confirmation_required)
+        & (frame["SellMACrossDown"] | frame["SellMALoseFast"])
+    )
+
+    state_rows = frame.copy()
+    state_rows["BuySetupActive"] = buy_setup_active.fillna(False)
+    state_rows["SellSetupActive"] = sell_setup_active.fillna(False)
+    state_rows["BuyTrigger"] = False
+    state_rows["SellTrigger"] = False
+    state_rows["State"] = "Hold / Neutral"
+    state_rows["HoldLockActive"] = False
+    state_rows["ReentryLockActive"] = False
+    state_rows["StopExitConfirmed"] = False
+    state_rows["StopEmergencyExit"] = False
+    state_rows["StopGapATR"] = np.nan
+    state_rows["BuyReasonText"] = ""
+    state_rows["SellReasonText"] = ""
+    state_rows["SignalNote"] = ""
+
     in_virtual_position = False
     entry_index = -10_000
     last_exit_index = -10_000
+    min_hold_bars = preset_min_hold_bars(preset)
+    reentry_lock_bars = preset_reentry_lock_bars(preset)
 
-    for index, row_tuple in enumerate(state_frame.itertuples(index=False, name="StateRow")):
+    for index, row_tuple in enumerate(state_rows.itertuples(index=False, name="StateRow")):
         row = TupleRowAccessor(row_tuple)
-        buy_score = int(row.get("BuyScore", 0) or 0)
-        sell_score = int(row.get("SellScore", 0) or 0)
         regime = str(row.get("Regime", "Range / Transition"))
-        bull_regime = _is_bull_regime(regime)
         bear_regime = _is_bear_regime(regime)
-        reference_asset = _coerce_bool(row.get("ReferenceAsset"))
-        buy_trigger = _coerce_bool(row.get("BuyTrigger", False))
-        sell_trigger = _coerce_bool(row.get("SellTrigger", False))
-        buy_window = _coerce_bool(row.get("BuySetupWindow", False))
-        sell_window = _coerce_bool(row.get("SellSetupWindow", False))
-        close_up_day = _coerce_bool(row.get("CloseUpDay", False))
-        close_down_day = _coerce_bool(row.get("CloseDownDay", False))
-        stop_touched = _coerce_bool(row.get("StopTouched", False))
-        stop_close_breach = _coerce_bool(row.get("StopCloseBreach", False))
-        close_value = _coerce_float(row.get("Close"))
-        stop_price = _coerce_float(row.get("ChandelierStop"))
-        atr_value = _coerce_float(row.get("ATR"))
-        cycle_score = _coerce_float(row.get("CycleScore"))
-        rsi = _coerce_float(row.get("RSI"))
-        mfi = _coerce_float(row.get("MFI"))
-        fear_greed = _coerce_float(row.get("FearGreed"))
-        atr_stretch = _coerce_float(row.get("ATRStretch"))
-        panic_low = bool(
-            cycle_score is not None
-            and rsi is not None
-            and (
-                (cycle_score <= 15 and rsi <= 40)
-                or (cycle_score <= 25 and rsi <= 35)
-            )
-        )
-        volume_ratio = _coerce_float(row.get("VolumeRatio20"))
-        mfi_change = _coerce_float(row.get("MFIChange5"))
-        rs_percentile = _coerce_float(row.get("RSPercentile"))
-        cmf20 = _coerce_float(row.get("CMF20"))
-        obv_slope10 = _coerce_float(row.get("OBVSlope10"))
-        macd_bull_cross = _coerce_bool(row.get("MACDBullCross", False))
-        macd_bear_cross = _coerce_bool(row.get("MACDBearCross", False))
-        bb_pos = _coerce_float(row.get("BBPos20"))
-        bb_width_pct = _coerce_float(row.get("BBWidthPct"))
-        volume_climax_up = _coerce_bool(row.get("VolumeClimaxUp", False))
-        volume_climax_down = _coerce_bool(row.get("VolumeClimaxDown", False))
-        volume_dry_up = _coerce_bool(row.get("VolumeDryUp", False))
-        tips_risk_off = _coerce_bool(row.get("TIPSRiskOff", False))
-        buy_peak_score = _coerce_float(row.get("BuySetupPeakScore")) or 0.0
-        sell_peak_score = _coerce_float(row.get("SellSetupPeakScore")) or 0.0
-        buy_rsi_cutoff = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_reset"])
-        buy_rsi_extreme = bool(rsi is not None and rsi <= BUY_CUTOFFS["rsi_extreme"])
-        buy_mfi_cutoff = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_reset"])
-        buy_mfi_extreme = bool(mfi is not None and mfi <= BUY_CUTOFFS["mfi_extreme"])
-        buy_fear_cutoff = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_reset"])
-        buy_fear_extreme = bool(fear_greed is not None and fear_greed <= BUY_CUTOFFS["fear_extreme"])
-        buy_bb_cutoff = bool(bb_pos is not None and bb_pos <= BUY_CUTOFFS["bb_low"])
-        buy_bb_extreme = bool(bb_pos is not None and bb_pos <= 0.10)
-        buy_cutoff_hits = int(sum([buy_rsi_cutoff, buy_mfi_cutoff, buy_fear_cutoff, buy_bb_cutoff]))
-        buy_extreme_hits = int(sum([buy_rsi_extreme, buy_mfi_extreme, buy_fear_extreme, buy_bb_extreme]))
-        dryup_reversal = bool(
-            volume_dry_up
-            and cycle_score is not None
-            and cycle_score <= 25
-            and rsi is not None
-            and rsi <= 44
-        )
-        accumulation_flow = bool(
-            volume_climax_up
-            or (
-                cmf20 is not None
-                and cmf20 >= 0.03
-                and obv_slope10 is not None
-                and obv_slope10 > 0
-            )
-        )
-        distribution_flow = bool(
-            volume_climax_down
-            or (
-                cmf20 is not None
-                and cmf20 <= -0.03
-                and obv_slope10 is not None
-                and obv_slope10 < 0
-            )
-        )
-        flow_conflict = distribution_flow and not accumulation_flow
-        chop_zone = bool(bb_width_pct is not None and bb_width_pct <= 30)
-        buy_flow_support = bool(
-            (volume_ratio is not None and volume_ratio >= 1.02)
-            or (mfi_change is not None and mfi_change >= 2.0)
-            or (rs_percentile is not None and rs_percentile >= (42.0 if reference_asset else 45.0))
-            or accumulation_flow
-            or dryup_reversal
-        )
-        if flow_conflict and not panic_low and not macd_bull_cross:
-            buy_flow_support = False
-        sell_flow_support = bool(
-            (volume_ratio is not None and volume_ratio >= 1.02)
-            or (mfi_change is not None and mfi_change <= -2.0)
-            or (rs_percentile is not None and rs_percentile <= 40.0)
-            or distribution_flow
-        )
-        reversal_zone = bool(
-            panic_low
-            or (cycle_score is not None and cycle_score <= 35)
-            or buy_score >= preset.watch_threshold
-        )
-        reversal_confirmation = bool(
-            _coerce_bool(row.get("BuyTriggerPrice", False))
-            or macd_bull_cross
-            or (close_up_day and buy_flow_support and reversal_zone)
-            or (reference_asset and close_up_day and reversal_zone and buy_peak_score >= preset.watch_threshold - 6)
-        )
-        breakdown_confirmation = bool(
-            _coerce_bool(row.get("SellTriggerPrice", False))
-            or macd_bear_cross
-            or (close_down_day and sell_flow_support)
-        )
         hold_lock_active = in_virtual_position and (index - entry_index) < min_hold_bars
         reentry_lock_active = (not in_virtual_position) and (index - last_exit_index) < reentry_lock_bars
         stop_exit_confirmed, stop_emergency_exit, stop_gap_atr = evaluate_stop_exit(
-            close_value,
-            stop_price,
-            atr_value,
-            sell_score=int(round(sell_peak_score or sell_score)),
-            buy_score=buy_score,
+            _coerce_float(row.get("Close")),
+            _coerce_float(row.get("ChandelierStop")),
+            _coerce_float(row.get("ATR")),
+            sell_score=int(row.get("SellScore", 0) or 0),
+            buy_score=int(row.get("BuyScore", 0) or 0),
             bearish_context=bear_regime,
-            sell_context=bool(sell_window or _coerce_bool(row.get("SellSetupActive", False)) or _coerce_bool(row.get("SellTriggerPrice", False))),
+            sell_context=bool(_coerce_bool(row.get("SellSetupActive")) or _coerce_bool(row.get("SellTriggerPrice"))),
             hold_lock_active=hold_lock_active,
-            macro_risk_off=tips_risk_off,
+            macro_risk_off=_coerce_bool(row.get("TIPSRiskOff")),
         )
-        sell_capitulation_block = bool(
-            panic_low
-            or buy_extreme_hits >= 2
-            or (cycle_score is not None and cycle_score <= 30 and buy_cutoff_hits >= 2)
-        )
-        if sell_capitulation_block and not stop_emergency_exit:
-            sell_window = False
-            if not _coerce_bool(row.get("SellTriggerPrice", False)):
-                sell_trigger = False
-                breakdown_confirmation = False
 
-        if not buy_trigger and buy_window and reversal_confirmation and reversal_zone:
-            if (
-                buy_peak_score >= preset.watch_threshold - (6 if reference_asset else 2)
-                and sell_score <= max(buy_peak_score + 8, preset.strong_threshold + 2)
-                and not (bear_regime and breakdown_confirmation and not panic_low)
-                and not stop_exit_confirmed
-                and (not chop_zone or macd_bull_cross or buy_flow_support or panic_low)
-                and (not flow_conflict or panic_low or macd_bull_cross)
-            ):
-                buy_trigger = True
-        if not sell_trigger and sell_window and breakdown_confirmation and not panic_low and not sell_capitulation_block:
-            if sell_peak_score >= preset.watch_threshold + (6 if reference_asset else 4):
-                if sell_flow_support and (bear_regime or stop_exit_confirmed or _coerce_bool(row.get("SellTriggerPrice", False)) or macd_bear_cross):
-                    sell_trigger = True
-        if reference_asset and panic_low and buy_window and reversal_confirmation and buy_peak_score >= preset.watch_threshold - 8:
-            buy_trigger = True
-            sell_trigger = False
-
-        force_exit = bool(
-            stop_emergency_exit
-            or (
-                sell_trigger
-                and (
-                    sell_peak_score >= max(preset.strong_threshold + 8, buy_score + 10)
-                    or str(row.get("State", "")) == "Strong Sell"
-                )
+        buy_trigger = bool(row.get("BuySetupActive")) and bool(buy_trigger_candidate.iloc[index]) and not reentry_lock_active and not stop_exit_confirmed
+        sell_trigger = (
+            in_virtual_position
+            and (
+                stop_emergency_exit
+                or stop_exit_confirmed
+                or (bool(row.get("SellSetupActive")) and bool(sell_trigger_candidate.iloc[index]) and not bool(row.get("SellCapitulationBlock")))
             )
         )
-        if hold_lock_active and not force_exit:
-            sell_trigger = False
-        if reentry_lock_active and buy_trigger and buy_peak_score < max(preset.strong_threshold + 2, sell_score + 10):
+        if hold_lock_active and not stop_emergency_exit:
+            sell_trigger = bool(stop_exit_confirmed and _coerce_bool(row.get("StopCloseBreach")))
+        if stop_emergency_exit:
             buy_trigger = False
+            sell_trigger = True
 
-        buy_strong_threshold = preset.strong_threshold - (8 if reference_asset else 5) if bull_regime else preset.strong_threshold - (4 if reference_asset else 0)
-        sell_strong_threshold = preset.strong_threshold + 10 if bull_regime and not stop_exit_confirmed else preset.strong_threshold
-        if reference_asset and panic_low and (buy_trigger or buy_window):
-            if buy_peak_score >= preset.strong_threshold - 6 and reversal_confirmation:
-                state = "Strong Buy"
-            elif reversal_confirmation or buy_peak_score >= preset.watch_threshold + 2:
-                state = "Buy"
-            else:
-                state = "Weak Buy"
-        elif sell_trigger and (stop_emergency_exit or sell_peak_score >= max(sell_strong_threshold, buy_score + 10)):
+        buy_reason_parts = _build_buy_reason_parts(row)
+        sell_reason_parts = _build_sell_reason_parts(row)
+
+        if stop_emergency_exit:
             state = "Strong Sell"
-        elif sell_trigger and sell_peak_score >= max(preset.watch_threshold + 8, buy_score + 6):
+        elif sell_trigger and int(row.get("SellScore", 0) or 0) >= max(strategy.sell_score_threshold + 10, int(row.get("BuyScore", 0) or 0) + 8):
+            state = "Strong Sell"
+        elif sell_trigger:
             state = "Sell"
-        elif buy_trigger and buy_peak_score >= max(preset.watch_threshold + 10, buy_strong_threshold) and sell_score <= buy_peak_score + 6:
+        elif buy_trigger and int(row.get("BuyScore", 0) or 0) >= max(strategy.buy_score_threshold + 10, preset.strong_threshold):
             state = "Strong Buy"
-        elif buy_trigger and buy_peak_score >= max(preset.watch_threshold + 2, sell_score):
+        elif buy_trigger:
             state = "Buy"
-        elif buy_window and buy_peak_score >= preset.watch_threshold - (8 if reference_asset else 6) and sell_score <= buy_peak_score + 12:
+        elif bool(row.get("BuySetupActive")) and int(row.get("BuyScore", 0) or 0) >= max(strategy.buy_score_threshold - 10, preset.watch_threshold - 4):
             state = "Weak Buy"
-        elif sell_window and not panic_low and not sell_capitulation_block and sell_peak_score >= preset.watch_threshold + (8 if reference_asset else 2) and sell_score > buy_score + (6 if reference_asset else 4):
-            state = "Sell"
-        elif sell_window and not panic_low and not sell_capitulation_block and sell_peak_score >= preset.watch_threshold - (2 if reference_asset else 3) and sell_score > buy_score + (4 if reference_asset else 2):
+        elif bool(row.get("SellSetupActive")) and not bool(row.get("SellCapitulationBlock")):
             state = "Weak Sell"
         else:
             state = "Hold / Neutral"
 
-        if hold_lock_active and not force_exit:
-            if state in {"Strong Sell", "Sell"}:
-                state = "Weak Buy" if buy_window else "Hold / Neutral"
-            elif state == "Weak Sell":
-                state = "Hold / Neutral"
-        if reentry_lock_active and not buy_trigger:
-            if state in {"Strong Buy", "Buy"}:
-                state = "Weak Buy"
-        if stop_emergency_exit:
-            buy_trigger = False
-            sell_trigger = True
-            state = "Strong Sell"
-        elif state in {"Strong Buy", "Buy", "Weak Buy"}:
-            sell_trigger = False
-        elif state in {"Strong Sell", "Sell", "Weak Sell"}:
-            buy_trigger = False
-
-        updated_buy_trigger.append(buy_trigger)
-        updated_sell_trigger.append(sell_trigger)
-        updated_state.append(state)
-        hold_lock_flags.append(hold_lock_active)
-        reentry_lock_flags.append(reentry_lock_active)
-        updated_stop_exit_confirmed.append(stop_exit_confirmed)
-        updated_stop_emergency_exit.append(stop_emergency_exit)
-        updated_stop_gap_atr.append(stop_gap_atr)
+        state_rows.iat[index, state_rows.columns.get_loc("BuyTrigger")] = buy_trigger
+        state_rows.iat[index, state_rows.columns.get_loc("SellTrigger")] = sell_trigger
+        state_rows.iat[index, state_rows.columns.get_loc("State")] = state
+        state_rows.iat[index, state_rows.columns.get_loc("HoldLockActive")] = hold_lock_active
+        state_rows.iat[index, state_rows.columns.get_loc("ReentryLockActive")] = reentry_lock_active
+        state_rows.iat[index, state_rows.columns.get_loc("StopExitConfirmed")] = stop_exit_confirmed
+        state_rows.iat[index, state_rows.columns.get_loc("StopEmergencyExit")] = stop_emergency_exit
+        state_rows.iat[index, state_rows.columns.get_loc("StopGapATR")] = stop_gap_atr if stop_gap_atr is not None else np.nan
+        if include_notes:
+            state_rows.iat[index, state_rows.columns.get_loc("BuyReasonText")] = " | ".join(buy_reason_parts)
+            state_rows.iat[index, state_rows.columns.get_loc("SellReasonText")] = " | ".join(sell_reason_parts)
+            state_rows.iat[index, state_rows.columns.get_loc("SignalNote")] = _compose_signal_note(TupleRowAccessor(state_rows.iloc[index]), state)
 
         if not in_virtual_position and buy_trigger:
             in_virtual_position = True
@@ -3488,16 +1719,10 @@ def build_state_frame(indicator_frame: pd.DataFrame, preset: SignalPreset) -> pd
             last_exit_index = index
             entry_index = -10_000
 
-    state_frame["BuyTrigger"] = updated_buy_trigger
-    state_frame["SellTrigger"] = updated_sell_trigger
-    state_frame["State"] = updated_state
-    state_frame["SignalNote"] = ""
-    state_frame["HoldLockActive"] = hold_lock_flags
-    state_frame["ReentryLockActive"] = reentry_lock_flags
-    state_frame["StopExitConfirmed"] = updated_stop_exit_confirmed
-    state_frame["StopEmergencyExit"] = updated_stop_emergency_exit
-    state_frame["StopGapATR"] = updated_stop_gap_atr
-    return state_frame
+    setup_window = max(3, min(6, preset.cooldown_bars + 1))
+    state_rows["BuySetupWindow"] = state_rows["BuySetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
+    state_rows["SellSetupWindow"] = state_rows["SellSetupActive"].rolling(setup_window, min_periods=1).max().fillna(0.0).astype(bool)
+    return state_rows
 
 
 def build_snapshot(
@@ -3540,116 +1765,102 @@ def build_watchlist_frame(snapshots: list[TickerSnapshot]) -> pd.DataFrame:
     return frame.drop(columns=["state_priority"])
 
 
-def compute_strategy_total_return(trade_frame: pd.DataFrame) -> float | None:
-    if trade_frame.empty:
+def compute_max_drawdown(equity_curve: pd.Series) -> float | None:
+    series = pd.to_numeric(equity_curve, errors="coerce").dropna()
+    if series.empty:
         return None
-    equity = 1.0
-    closed = trade_frame.loc[trade_frame["Status"] == "Closed"].copy()
-    for value in closed["Return"].tolist():
-        equity *= 1.0 + float(value)
-    open_trade = trade_frame.loc[trade_frame["Status"] == "Open"].copy()
-    if not open_trade.empty:
-        equity *= 1.0 + float(open_trade.iloc[-1]["Return"])
-    return float(equity - 1.0)
+    running_max = series.cummax()
+    drawdown = series / running_max - 1.0
+    return abs(float(drawdown.min()))
 
 
-def compute_buy_hold_return(state_frame: pd.DataFrame) -> tuple[float | None, float | None, float | None]:
+def compute_cagr(equity_curve: pd.Series) -> float | None:
+    series = pd.to_numeric(equity_curve, errors="coerce").dropna()
+    if len(series) < 2:
+        return None
+    start_value = float(series.iloc[0])
+    end_value = float(series.iloc[-1])
+    if start_value <= 0 or end_value <= 0:
+        return None
+    start_date = pd.Timestamp(series.index[0])
+    end_date = pd.Timestamp(series.index[-1])
+    years = max((end_date - start_date).days / 365.25, 1 / 365.25)
+    return float((end_value / start_value) ** (1.0 / years) - 1.0)
+
+
+def build_buy_hold_metrics(state_frame: pd.DataFrame, transaction_cost: float = TRANSACTION_COST_PER_SIDE) -> tuple[dict[str, float | None], pd.Series]:
     if state_frame.empty or "Close" not in state_frame.columns:
-        return None, None, None
+        return {
+            "buy_hold_return": None,
+            "buy_hold_start_price": None,
+            "buy_hold_end_price": None,
+            "buy_hold_max_drawdown": None,
+            "buy_hold_cagr": None,
+            "buy_hold_cost_drag": None,
+        }, pd.Series(dtype=float)
     close = pd.to_numeric(state_frame["Close"], errors="coerce").dropna()
     if close.empty:
-        return None, None, None
+        return {
+            "buy_hold_return": None,
+            "buy_hold_start_price": None,
+            "buy_hold_end_price": None,
+            "buy_hold_max_drawdown": None,
+            "buy_hold_cagr": None,
+            "buy_hold_cost_drag": None,
+        }, pd.Series(dtype=float)
     start_price = float(close.iloc[0])
     end_price = float(close.iloc[-1])
     if start_price <= 0:
-        return None, start_price, end_price
-    return float(end_price / start_price - 1.0), start_price, end_price
+        return {
+            "buy_hold_return": None,
+            "buy_hold_start_price": start_price,
+            "buy_hold_end_price": end_price,
+            "buy_hold_max_drawdown": None,
+            "buy_hold_cagr": None,
+            "buy_hold_cost_drag": None,
+        }, pd.Series(dtype=float)
 
-
-def build_replay_summary(trade_frame: pd.DataFrame) -> dict[str, float | int | None]:
-    closed = trade_frame.loc[trade_frame["Status"] == "Closed"].copy() if not trade_frame.empty else pd.DataFrame()
-    open_trade = trade_frame.loc[trade_frame["Status"] == "Open"].copy() if not trade_frame.empty else pd.DataFrame()
+    shares = (1.0 - transaction_cost) / start_price
+    equity_curve = shares * close
+    equity_curve.iloc[-1] = equity_curve.iloc[-1] * (1.0 - transaction_cost)
+    raw_return = float(end_price / start_price - 1.0)
+    net_return = float(equity_curve.iloc[-1] - 1.0)
     return {
-        "closed_trades": int(len(closed)),
-        "win_rate": float(closed["Return"].gt(0.0).mean()) if not closed.empty else None,
-        "avg_closed_return": float(closed["Return"].mean()) if not closed.empty else None,
-        "median_closed_return": float(closed["Return"].median()) if not closed.empty else None,
-        "avg_hold_days": float(closed["HoldDays"].mean()) if not closed.empty else None,
-        "open_trade_return": float(open_trade["Return"].iloc[-1]) if not open_trade.empty else None,
-        "strategy_total_return": compute_strategy_total_return(trade_frame),
-    }
-
-
-def build_strategy_vs_benchmark_summary(
-    state_frame: pd.DataFrame,
-    trade_frame: pd.DataFrame,
-) -> dict[str, float | int | None]:
-    summary = build_replay_summary(trade_frame)
-    buy_hold_return, buy_hold_start_price, buy_hold_end_price = compute_buy_hold_return(state_frame)
-    strategy_total_return = summary.get("strategy_total_return")
-    summary["buy_hold_return"] = buy_hold_return
-    summary["buy_hold_start_price"] = buy_hold_start_price
-    summary["buy_hold_end_price"] = buy_hold_end_price
-    summary["excess_return"] = (
-        None
-        if strategy_total_return is None or buy_hold_return is None
-        else float(strategy_total_return - buy_hold_return)
-    )
-    summary["relative_alpha"] = (
-        None
-        if strategy_total_return is None or buy_hold_return is None
-        else float((1.0 + strategy_total_return) / (1.0 + buy_hold_return) - 1.0)
-    )
-    return summary
-
-
-def build_buy_hold_trade_frame(ticker: str, state_frame: pd.DataFrame) -> pd.DataFrame:
-    if state_frame.empty or "Close" not in state_frame.columns:
-        return pd.DataFrame()
-    close = pd.to_numeric(state_frame["Close"], errors="coerce").dropna()
-    if close.empty:
-        return pd.DataFrame()
-    entry_date = pd.Timestamp(close.index[0])
-    exit_date = pd.Timestamp(close.index[-1])
-    entry_price = float(close.iloc[0])
-    exit_price = float(close.iloc[-1])
-    if entry_price <= 0:
-        return pd.DataFrame()
-    return pd.DataFrame(
-        [
-            {
-                "Ticker": ticker,
-                "Trade": 1,
-                "Status": "Closed",
-                "EntryDate": entry_date,
-                "ExitDate": exit_date,
-                "EntryPrice": entry_price,
-                "ExitPrice": exit_price,
-                "Return": float(exit_price / entry_price - 1.0),
-                "HoldDays": int((exit_date - entry_date).days),
-                "PartialScaledOut": "No",
-            }
-        ]
-    )
+        "buy_hold_return": net_return,
+        "buy_hold_start_price": start_price,
+        "buy_hold_end_price": end_price,
+        "buy_hold_max_drawdown": compute_max_drawdown(equity_curve),
+        "buy_hold_cagr": compute_cagr(equity_curve),
+        "buy_hold_cost_drag": raw_return - net_return,
+    }, equity_curve
 
 
 def build_trade_replay_from_state_frame(
     ticker: str,
     state_frame: pd.DataFrame,
     preset: SignalPreset,
+    *,
+    transaction_cost: float = TRANSACTION_COST_PER_SIDE,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int | None]]:
     if state_frame.empty:
         empty_summary: dict[str, float | int | None] = {
             "closed_trades": 0,
+            "trade_count": 0,
             "win_rate": None,
             "avg_closed_return": None,
             "median_closed_return": None,
             "avg_hold_days": None,
             "open_trade_return": None,
             "strategy_total_return": None,
+            "max_drawdown": None,
+            "cagr": None,
+            "cost_drag": None,
             "buy_hold_return": None,
             "buy_hold_start_price": None,
             "buy_hold_end_price": None,
+            "buy_hold_max_drawdown": None,
+            "buy_hold_cagr": None,
+            "buy_hold_cost_drag": None,
             "excess_return": None,
             "relative_alpha": None,
         }
@@ -3657,17 +1868,19 @@ def build_trade_replay_from_state_frame(
 
     events: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
+    equity_rows: list[dict[str, Any]] = []
+    cash = 1.0
+    shares = 0.0
+    cumulative_cost_paid = 0.0
     in_position = False
     partial_taken = False
     trade_id = 0
     entry_date: pd.Timestamp | None = None
     entry_price: float | None = None
-    position_remaining = 0.0
-    realized_return = 0.0
+    entry_equity: float | None = None
     last_buy_index = -10_000
     last_sell_index = -10_000
     last_partial_index = -10_000
-    last_scale_index = -10_000
     entry_index = -10_000
     min_hold_bars = preset_min_hold_bars(preset)
     partial_hold_bars = max(1, min_hold_bars - 1)
@@ -3676,105 +1889,51 @@ def build_trade_replay_from_state_frame(
     for position, row in enumerate(iter_frame.itertuples(index=False)):
         timestamp = pd.Timestamp(row.Date)
         state = str(row.State)
-        state_sell_side = state in {"Weak Sell", "Sell", "Strong Sell"}
         price = float(row.Close)
-        low_price = float(getattr(row, "Low", price))
-        stop_price = float(row.ChandelierStop) if pd.notna(getattr(row, "ChandelierStop", np.nan)) else np.nan
-        stop_touched = bool(
-            _coerce_bool(getattr(row, "StopTouched", False))
-            or (pd.notna(stop_price) and low_price <= stop_price)
-        )
+        buy_score = int(row.BuyScore)
+        sell_score = int(row.SellScore)
+        buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", state in {"Buy", "Strong Buy"}))
+        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", state in {"Sell", "Strong Sell"}))
+        sell_setup_active = _coerce_bool(getattr(row, "SellSetupActive", state in {"Weak Sell", "Sell", "Strong Sell"}))
+        stop_emergency_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
+        stop_exit_confirmed = _coerce_bool(getattr(row, "StopExitConfirmed", False))
         note = str(getattr(row, "SignalNote", "") or "")
         if not note:
             note = _compose_signal_note(TupleRowAccessor(row), state)
-        buy_score = int(row.BuyScore)
-        sell_score = int(row.SellScore)
-        atr_value = _coerce_float(getattr(row, "ATR", np.nan))
-        buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", state in {"Buy", "Strong Buy"}))
-        sell_setup_active = _coerce_bool(getattr(row, "SellSetupActive", state_sell_side))
-        regime = str(getattr(row, "Regime", "") or "")
-        regime_known = bool(regime)
-        bull_regime = regime in ML_BULL_REGIMES
-        close_up_day = _coerce_bool(getattr(row, "CloseUpDay", False))
-        deep_value_confluence = _coerce_bool(getattr(row, "DeepValueConfluence", False))
-        heat_trim_confluence = _coerce_bool(getattr(row, "HeatTrimConfluence", False))
-        macro_trend_exit = _coerce_bool(getattr(row, "MacroTrendExit", False))
-        if regime_known and not deep_value_confluence:
-            deep_value_confluence, _ = detect_deep_value_confluence(TupleRowAccessor(row))
-        if regime_known and not heat_trim_confluence:
-            heat_trim_confluence, _ = detect_heat_trim_confluence(TupleRowAccessor(row))
-        if regime_known and not macro_trend_exit:
-            macro_trend_exit = detect_macro_trend_exit(TupleRowAccessor(row))
-        hold_bars_elapsed = position - entry_index if in_position else 10_000
-        hold_lock_active = in_position and hold_bars_elapsed < min_hold_bars
-        stop_exit_confirmed = _coerce_bool(getattr(row, "StopExitConfirmed", False))
-        stop_emergency_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
-        if not stop_exit_confirmed and not stop_emergency_exit:
-            stop_exit_confirmed, stop_emergency_exit, _ = evaluate_stop_exit(
-                price,
-                None if pd.isna(stop_price) else stop_price,
-                atr_value,
-                sell_score=sell_score,
-                buy_score=buy_score,
-                bearish_context=state in {"Sell", "Strong Sell"},
-                sell_context=bool(sell_setup_active or state_sell_side),
-                hold_lock_active=hold_lock_active,
-            )
-        sell_trigger = (
-            _coerce_bool(getattr(row, "SellTrigger", state in {"Sell", "Strong Sell"}))
-            or stop_emergency_exit
-            or (stop_exit_confirmed and state_sell_side)
-        )
-        force_exit = bool(
-            (not regime_known and stop_emergency_exit)
-            or (
-                not regime_known
-                and state == "Strong Sell"
-                and sell_score >= max(preset.strong_threshold + 8, buy_score + 10)
-            )
-        )
 
+        hold_bars_elapsed = position - entry_index if in_position else 10_000
+        force_exit = bool(stop_emergency_exit)
         buy_ready = (not in_position) and buy_trigger and (position - last_buy_index) >= preset.cooldown_bars
-        scale_in_ready = (
-            in_position
-            and position_remaining < 1.0
-            and deep_value_confluence
-            and (buy_trigger or close_up_day)
-            and (position - last_scale_index) >= LOW_CONFLUENCE_SCALE_IN_COOLDOWN_BARS
-        )
         partial_ready = (
             in_position
-            and position_remaining > (1.0 - HEAT_TRIM_REDUCE_WEIGHT)
-            and (
-                heat_trim_confluence
-                or (
-                    not regime_known
-                    and (not partial_taken)
-                    and state == "Weak Sell"
-                    and sell_setup_active
-                    and not stop_exit_confirmed
-                )
-            )
+            and (not partial_taken)
+            and state == "Weak Sell"
+            and sell_setup_active
+            and not stop_exit_confirmed
             and (hold_bars_elapsed >= partial_hold_bars)
-            and (position - last_partial_index) >= HEAT_TRIM_COOLDOWN_BARS
+            and (position - last_partial_index) >= preset.cooldown_bars
         )
         sell_ready = (
             in_position
-            and (macro_trend_exit or ((not regime_known) and sell_trigger))
-            and ((hold_bars_elapsed >= min_hold_bars) or force_exit or macro_trend_exit)
+            and sell_trigger
+            and ((hold_bars_elapsed >= min_hold_bars) or force_exit)
             and (position - last_sell_index) >= preset.cooldown_bars
         )
 
-        if buy_ready:
+        if buy_ready and price > 0 and cash > 0:
             trade_id += 1
+            trade_cash = cash
+            buy_cost = trade_cash * transaction_cost
+            cumulative_cost_paid += buy_cost
+            shares = (trade_cash - buy_cost) / price
+            cash = 0.0
             in_position = True
             partial_taken = False
-            entry_date = pd.Timestamp(timestamp)
+            entry_date = timestamp
             entry_price = price
-            position_remaining = 1.0
-            realized_return = 0.0
-            last_buy_index = position
+            entry_equity = trade_cash
             entry_index = position
+            last_buy_index = position
             events.append(
                 {
                     "Ticker": ticker,
@@ -3785,42 +1944,20 @@ def build_trade_replay_from_state_frame(
                     "State": state,
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
-                    "PositionAfter": position_remaining,
+                    "PositionAfter": 1.0,
                     "Reason": note,
                 }
             )
-            continue
-
-        if scale_in_ready and entry_price is not None and position_remaining > 0:
-            buy_weight = min(LOW_CONFLUENCE_SCALE_IN_WEIGHT, 1.0 - position_remaining)
-            if buy_weight > 0:
-                entry_price = ((entry_price * position_remaining) + (price * buy_weight)) / (position_remaining + buy_weight)
-                position_remaining += buy_weight
-                last_scale_index = position
-                events.append(
-                    {
-                        "Ticker": ticker,
-                        "Trade": trade_id,
-                        "Date": timestamp,
-                        "Signal": "SCALE IN BUY",
-                        "Price": price,
-                        "State": state,
-                        "BuyScore": buy_score,
-                        "SellScore": sell_score,
-                        "PositionAfter": position_remaining,
-                        "Reason": "Deep value confluence scale-in",
-                    }
-                )
-                continue
-
-        if partial_ready and entry_price is not None and position_remaining > 0:
-            sell_weight = max(0.0, position_remaining - (1.0 - HEAT_TRIM_REDUCE_WEIGHT))
-            if sell_weight <= 0:
-                sell_weight = min(HEAT_TRIM_REDUCE_WEIGHT, position_remaining)
-            realized_return += sell_weight * (price / entry_price - 1.0)
-            position_remaining -= sell_weight
+        elif partial_ready and shares > 0:
+            shares_to_sell = shares * 0.5
+            gross_proceeds = shares_to_sell * price
+            sell_cost = gross_proceeds * transaction_cost
+            cumulative_cost_paid += sell_cost
+            cash += gross_proceeds - sell_cost
+            shares -= shares_to_sell
             partial_taken = True
             last_partial_index = position
+            position_after = 0.0 if (cash + (shares * price)) <= 0 else float((shares * price) / (cash + (shares * price)))
             events.append(
                 {
                     "Ticker": ticker,
@@ -3831,28 +1968,30 @@ def build_trade_replay_from_state_frame(
                     "State": state,
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
-                    "PositionAfter": position_remaining,
-                    "Reason": "Fear/RSI/MA trim confluence" if heat_trim_confluence else note,
+                    "PositionAfter": position_after,
+                    "Reason": note,
                 }
             )
-            continue
-
-        if sell_ready and entry_price is not None and entry_date is not None and position_remaining > 0:
-            exit_price = price
-            realized_return += position_remaining * (exit_price / entry_price - 1.0)
+        elif sell_ready and shares > 0 and entry_equity is not None and entry_date is not None:
+            gross_proceeds = shares * price
+            sell_cost = gross_proceeds * transaction_cost
+            cumulative_cost_paid += sell_cost
+            cash += gross_proceeds - sell_cost
+            shares = 0.0
             last_sell_index = position
+            trade_return = None if entry_equity <= 0 else float(cash / entry_equity - 1.0)
             events.append(
                 {
                     "Ticker": ticker,
                     "Trade": trade_id,
                     "Date": timestamp,
                     "Signal": "SELL",
-                    "Price": exit_price,
+                    "Price": price,
                     "State": state,
                     "BuyScore": buy_score,
                     "SellScore": sell_score,
                     "PositionAfter": 0.0,
-                    "Reason": "MACD bear + fear regime exit" if macro_trend_exit else note,
+                    "Reason": note,
                 }
             )
             trades.append(
@@ -3863,8 +2002,8 @@ def build_trade_replay_from_state_frame(
                     "EntryDate": entry_date,
                     "ExitDate": timestamp,
                     "EntryPrice": entry_price,
-                    "ExitPrice": exit_price,
-                    "Return": realized_return,
+                    "ExitPrice": price,
+                    "Return": trade_return,
                     "HoldDays": int((timestamp - entry_date).days),
                     "PartialScaledOut": "Yes" if partial_taken else "No",
                 }
@@ -3873,15 +2012,20 @@ def build_trade_replay_from_state_frame(
             partial_taken = False
             entry_date = None
             entry_price = None
-            position_remaining = 0.0
-            realized_return = 0.0
+            entry_equity = None
             entry_index = -10_000
-            last_scale_index = -10_000
 
-    if in_position and entry_price is not None and entry_date is not None:
+        equity_rows.append(
+            {
+                "Date": timestamp,
+                "Equity": cash + (shares * price),
+            }
+        )
+
+    if in_position and entry_equity is not None and entry_date is not None:
         last_timestamp = pd.Timestamp(state_frame.index[-1])
         last_price = float(state_frame["Close"].iloc[-1])
-        mark_to_market = realized_return + (position_remaining * (last_price / entry_price - 1.0))
+        mark_to_market = cash + (shares * last_price)
         trades.append(
             {
                 "Ticker": ticker,
@@ -3891,7 +2035,7 @@ def build_trade_replay_from_state_frame(
                 "ExitDate": last_timestamp,
                 "EntryPrice": entry_price,
                 "ExitPrice": last_price,
-                "Return": mark_to_market,
+                "Return": float(mark_to_market / entry_equity - 1.0),
                 "HoldDays": int((last_timestamp - entry_date).days),
                 "PartialScaledOut": "Yes" if partial_taken else "No",
             }
@@ -3899,7 +2043,37 @@ def build_trade_replay_from_state_frame(
 
     event_frame = pd.DataFrame(events)
     trade_frame = pd.DataFrame(trades)
-    return event_frame, trade_frame, build_strategy_vs_benchmark_summary(state_frame, trade_frame)
+    equity_frame = pd.DataFrame(equity_rows)
+    equity_curve = pd.Series(equity_frame["Equity"].to_numpy(dtype=float), index=pd.to_datetime(equity_frame["Date"])) if not equity_frame.empty else pd.Series(dtype=float)
+    closed = trade_frame.loc[trade_frame["Status"] == "Closed"].copy() if not trade_frame.empty else pd.DataFrame()
+    open_trade = trade_frame.loc[trade_frame["Status"] == "Open"].copy() if not trade_frame.empty else pd.DataFrame()
+
+    summary: dict[str, float | int | None] = {
+        "closed_trades": int(len(closed)),
+        "trade_count": int(len(trade_frame)),
+        "win_rate": float(closed["Return"].gt(0.0).mean()) if not closed.empty else None,
+        "avg_closed_return": float(closed["Return"].mean()) if not closed.empty else None,
+        "median_closed_return": float(closed["Return"].median()) if not closed.empty else None,
+        "avg_hold_days": float(closed["HoldDays"].mean()) if not closed.empty else None,
+        "open_trade_return": float(open_trade["Return"].iloc[-1]) if not open_trade.empty else None,
+        "strategy_total_return": float(equity_curve.iloc[-1] - 1.0) if not equity_curve.empty else None,
+        "max_drawdown": compute_max_drawdown(equity_curve),
+        "cagr": compute_cagr(equity_curve),
+        "cost_drag": cumulative_cost_paid,
+    }
+    buy_hold_metrics, _ = build_buy_hold_metrics(state_frame, transaction_cost=transaction_cost)
+    summary.update(buy_hold_metrics)
+    strategy_total_return = summary.get("strategy_total_return")
+    buy_hold_return = summary.get("buy_hold_return")
+    summary["excess_return"] = (
+        None if strategy_total_return is None or buy_hold_return is None else float(strategy_total_return - buy_hold_return)
+    )
+    summary["relative_alpha"] = (
+        None
+        if strategy_total_return is None or buy_hold_return is None
+        else float((1.0 + strategy_total_return) / (1.0 + buy_hold_return) - 1.0)
+    )
+    return event_frame, trade_frame, summary
 
 
 def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) -> pd.DataFrame:
@@ -3913,61 +2087,32 @@ def build_chart_signal_frame(state_frame: pd.DataFrame, preset: SignalPreset) ->
 
     for position, row in enumerate(iter_frame.itertuples(index=False)):
         price = float(row.Close)
-        stop_price = float(row.ChandelierStop) if pd.notna(getattr(row, "ChandelierStop", np.nan)) else np.nan
-        atr_value = _coerce_float(getattr(row, "ATR", np.nan))
         buy_trigger = _coerce_bool(getattr(row, "BuyTrigger", str(row.State) in {"Buy", "Strong Buy"}))
-        stop_exit_confirmed = _coerce_bool(getattr(row, "StopExitConfirmed", False))
-        stop_emergency_exit = _coerce_bool(getattr(row, "StopEmergencyExit", False))
-        if not stop_exit_confirmed and not stop_emergency_exit:
-            stop_exit_confirmed, stop_emergency_exit, _ = evaluate_stop_exit(
-                price,
-                None if pd.isna(stop_price) else stop_price,
-                atr_value,
-                sell_score=int(row.SellScore),
-                buy_score=int(row.BuyScore),
-                bearish_context=str(row.State) in {"Sell", "Strong Sell"},
-                sell_context=bool(_coerce_bool(getattr(row, "SellSetupActive", False)) or str(row.State) in {"Weak Sell", "Sell", "Strong Sell"}),
-                hold_lock_active=_coerce_bool(getattr(row, "HoldLockActive", False)),
+        sell_trigger = _coerce_bool(getattr(row, "SellTrigger", str(row.State) in {"Sell", "Strong Sell"}))
+        if buy_trigger and (position - last_buy_index) >= preset.cooldown_bars:
+            last_buy_index = position
+            markers.append(
+                {
+                    "Date": pd.Timestamp(row.Date),
+                    "Signal": "BUY",
+                    "Price": price,
+                    "State": str(row.State),
+                    "BuyScore": int(row.BuyScore),
+                    "SellScore": int(row.SellScore),
+                }
             )
-        sell_trigger = (
-            _coerce_bool(getattr(row, "SellTrigger", str(row.State) in {"Sell", "Strong Sell"}))
-            or stop_emergency_exit
-            or (stop_exit_confirmed and str(row.State) in {"Weak Sell", "Sell", "Strong Sell"})
-        )
-
-        if buy_trigger and sell_trigger:
-            if int(row.SellScore) >= int(row.BuyScore):
-                buy_trigger = False
-            else:
-                sell_trigger = False
-
-        if buy_trigger:
-            if (position - last_buy_index) >= preset.cooldown_bars:
-                last_buy_index = position
-                markers.append(
-                    {
-                        "Date": pd.Timestamp(row.Date),
-                        "Signal": "BUY",
-                        "Price": price,
-                        "State": str(row.State),
-                        "BuyScore": int(row.BuyScore),
-                        "SellScore": int(row.SellScore),
-                    }
-                )
-        if sell_trigger:
-            if (position - last_sell_index) >= preset.cooldown_bars:
-                last_sell_index = position
-                markers.append(
-                    {
-                        "Date": pd.Timestamp(row.Date),
-                        "Signal": "SELL",
-                        "Price": price,
-                        "State": str(row.State),
-                        "BuyScore": int(row.BuyScore),
-                        "SellScore": int(row.SellScore),
-                    }
-                )
-
+        if sell_trigger and (position - last_sell_index) >= preset.cooldown_bars:
+            last_sell_index = position
+            markers.append(
+                {
+                    "Date": pd.Timestamp(row.Date),
+                    "Signal": "SELL",
+                    "Price": price,
+                    "State": str(row.State),
+                    "BuyScore": int(row.BuyScore),
+                    "SellScore": int(row.SellScore),
+                }
+            )
     return pd.DataFrame(markers)
 
 
@@ -3978,7 +2123,7 @@ def build_price_context_figure(
     preset: SignalPreset,
 ) -> go.Figure:
     del preset
-    plot_frame = state_frame.loc[:, ["Close", "BuyScore", "SellScore", "State"]].copy().reset_index().rename(columns={"index": "Date"})
+    plot_frame = state_frame.loc[:, ["Close", "BuyScore", "SellScore", "State", "ConfigFastEMA", "ConfigSlowEMA", "ConfigFastSpan", "ConfigSlowSpan"]].copy().reset_index().rename(columns={"index": "Date"})
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -3991,6 +2136,11 @@ def build_price_context_figure(
             customdata=plot_frame[["BuyScore", "SellScore"]],
         )
     )
+
+    fast_span = int(plot_frame["ConfigFastSpan"].dropna().iloc[-1]) if not plot_frame["ConfigFastSpan"].dropna().empty else DEFAULT_RULE_CONFIG.fast_ema
+    slow_span = int(plot_frame["ConfigSlowSpan"].dropna().iloc[-1]) if not plot_frame["ConfigSlowSpan"].dropna().empty else DEFAULT_RULE_CONFIG.slow_ema
+    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["ConfigFastEMA"], mode="lines", name=f"EMA{fast_span}", line={"color": "#16a34a", "width": 1.5}))
+    fig.add_trace(go.Scatter(x=plot_frame["Date"], y=plot_frame["ConfigSlowEMA"], mode="lines", name=f"EMA{slow_span}", line={"color": "#ea580c", "width": 1.5}))
 
     if not event_frame.empty:
         marker_styles = {
@@ -4079,20 +2229,367 @@ def build_macro_figure(macro_data: dict[str, Any], history_years: int) -> go.Fig
     fig.add_trace(go.Scatter(x=plot_df.index, y=[80] * len(plot_df), mode="lines", line={"color": "#dc2626", "width": 1, "dash": "dot"}, showlegend=False), row=1, col=2)
     fig.add_trace(go.Scatter(x=plot_df.index, y=[20] * len(plot_df), mode="lines", line={"color": "#2563eb", "width": 1, "dash": "dot"}, showlegend=False), row=1, col=2)
     fig.add_trace(go.Scatter(x=plot_df.index, y=[50] * len(plot_df), mode="lines", line={"color": "#64748b", "width": 1, "dash": "dot"}, showlegend=False), row=2, col=2)
-    fig.update_layout(
-        title="Macro Fear & Greed Overview",
-        height=700,
-        margin={"l": 12, "r": 12, "t": 52, "b": 10},
-        legend={"orientation": "h", "y": 1.08},
-    )
-    fig.update_yaxes(title_text="Score", row=1, col=2)
-    fig.update_yaxes(title_text="Percentile", row=2, col=1)
-    fig.update_yaxes(title_text="Score", row=2, col=2)
+    fig.update_layout(height=640, margin={"l": 10, "r": 10, "t": 70, "b": 20}, legend={"orientation": "h"})
     return fig
 
 
-def render_header(macro_data: dict[str, Any], snapshots: list[TickerSnapshot]) -> None:
+def analyze_symbol_state(
+    ticker: str,
+    payload: dict[str, Any],
+    macro_data: dict[str, Any],
+    preset: SignalPreset,
+    config: RuleStrategyConfig,
+) -> dict[str, Any]:
+    price_frame = payload.get("frame", pd.DataFrame())
+    indicators = compute_indicators(
+        price_frame,
+        macro_data["score_series"],
+        macro_data.get("benchmark_close"),
+        macro_data.get("tips_13612w_momentum"),
+        payload.get("resolved_symbol"),
+    )
+    state_frame = build_state_frame(indicators, preset, config, include_notes=True)
+    snapshot = build_snapshot(ticker, payload.get("resolved_symbol", ticker), state_frame, payload.get("warning")) if not state_frame.empty else None
+    return {
+        "indicators": indicators,
+        "state_frame": state_frame,
+        "snapshot": snapshot,
+    }
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_core_indicator_inputs(end_iso: str) -> dict[str, Any]:
+    macro_data = load_macro_fear_greed_cached(end_iso)
+    payloads = load_price_payloads(list(CORE_TICKERS), OPTIMIZER_START_ISO, end_iso)
+    indicator_frames: dict[str, pd.DataFrame] = {}
+    for ticker in CORE_TICKERS:
+        payload = payloads.get(ticker, {"frame": pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)), "resolved_symbol": ticker, "warning": f"{ticker} payload unavailable"})
+        indicator_frames[ticker] = compute_indicators(
+            payload.get("frame", pd.DataFrame()),
+            macro_data["score_series"],
+            macro_data.get("benchmark_close"),
+            macro_data.get("tips_13612w_momentum"),
+            payload.get("resolved_symbol"),
+        )
+    return {
+        "macro_data": macro_data,
+        "payloads": payloads,
+        "indicator_frames": indicator_frames,
+    }
+
+
+def _validation_summary(rows: list[ValidationRow]) -> tuple[float, float, float, float, int]:
+    if not rows:
+        return -10_000.0, -10_000.0, -10_000.0, 0.0, 99
+    excess_values = [row.excess_return if row.excess_return is not None else -10_000.0 for row in rows]
+    drawdown_adv = [
+        ((row.buy_hold_max_drawdown or 0.0) - (row.max_drawdown or 0.0))
+        for row in rows
+    ]
+    win_rates = [row.win_rate if row.win_rate is not None else 0.0 for row in rows]
+    failing = sum(not row.pass_case for row in rows)
+    return (
+        float(min(excess_values)),
+        float(np.mean(excess_values)),
+        float(np.mean(drawdown_adv)),
+        float(np.mean(win_rates)),
+        failing,
+    )
+
+
+def _assess_validation_case(window_label: str, summary: dict[str, float | int | None]) -> tuple[bool, str | None]:
+    excess_return = summary.get("excess_return")
+    if excess_return is None or float(excess_return) < 0.0:
+        return False, "Underperformed buy and hold"
+
+    win_rate = summary.get("win_rate")
+    if win_rate is None or float(win_rate) < 0.35:
+        return False, "Win rate below 35%"
+
+    min_trades = 2 if window_label == "1Y" else 4
+    closed_trades = int(summary.get("closed_trades") or 0)
+    if closed_trades < min_trades:
+        return False, f"Closed trades below {min_trades}"
+
+    max_drawdown = summary.get("max_drawdown")
+    buy_hold_max_drawdown = summary.get("buy_hold_max_drawdown")
+    if max_drawdown is not None and buy_hold_max_drawdown is not None:
+        if float(max_drawdown) > float(buy_hold_max_drawdown) + 0.10:
+            return False, "Drawdown guardrail breached"
+
+    return True, None
+
+
+def validate_rule_strategy_config(
+    core_indicator_frames: dict[str, pd.DataFrame],
+    config: RuleStrategyConfig,
+    preset: SignalPreset,
+    *,
+    resume_cursor: int = 0,
+) -> OptimizerEvaluation:
+    validation_rows: list[ValidationRow] = []
+
+    for ticker, indicator_frame in core_indicator_frames.items():
+        if indicator_frame.empty:
+            continue
+        full_state_frame = build_state_frame(indicator_frame, preset, config, include_notes=False)
+        if full_state_frame.empty:
+            continue
+        max_date = pd.Timestamp(full_state_frame.index.max())
+        for window_label, days in VALIDATION_WINDOWS:
+            if days is None:
+                sliced = full_state_frame.copy()
+            else:
+                start_ts = max_date - pd.Timedelta(days=days)
+                sliced = full_state_frame.loc[full_state_frame.index >= start_ts].copy()
+            _, _, summary = build_trade_replay_from_state_frame(
+                ticker,
+                sliced,
+                preset,
+                transaction_cost=TRANSACTION_COST_PER_SIDE,
+            )
+            pass_case, fail_reason = _assess_validation_case(window_label, summary)
+            validation_rows.append(
+                ValidationRow(
+                    ticker=ticker,
+                    window=window_label,
+                    start_date=pd.Timestamp(sliced.index.min()).date().isoformat() if not sliced.empty else "n/a",
+                    end_date=pd.Timestamp(sliced.index.max()).date().isoformat() if not sliced.empty else "n/a",
+                    strategy_total_return=_coerce_float(summary.get("strategy_total_return")),
+                    buy_hold_return=_coerce_float(summary.get("buy_hold_return")),
+                    excess_return=_coerce_float(summary.get("excess_return")),
+                    max_drawdown=_coerce_float(summary.get("max_drawdown")),
+                    buy_hold_max_drawdown=_coerce_float(summary.get("buy_hold_max_drawdown")),
+                    cagr=_coerce_float(summary.get("cagr")),
+                    buy_hold_cagr=_coerce_float(summary.get("buy_hold_cagr")),
+                    win_rate=_coerce_float(summary.get("win_rate")),
+                    closed_trades=int(summary.get("closed_trades") or 0),
+                    pass_case=pass_case,
+                    fail_reason=fail_reason,
+                )
+            )
+
+    min_excess, average_excess, drawdown_advantage, average_win_rate, failing_count = _validation_summary(validation_rows)
+    failing_cases = tuple(
+        f"{row.ticker} {row.window}: {row.fail_reason}"
+        for row in validation_rows
+        if not row.pass_case and row.fail_reason
+    )
+    summary = {
+        "min_excess_return": min_excess,
+        "average_excess_return": average_excess,
+        "average_drawdown_advantage": drawdown_advantage,
+        "average_win_rate": average_win_rate,
+        "passed_cases": len(validation_rows) - failing_count,
+        "total_cases": len(validation_rows),
+        "failing_cases": failing_count,
+    }
+    return OptimizerEvaluation(
+        config=config,
+        config_hash=config.config_hash(),
+        validation_rows=tuple(validation_rows),
+        passed=all(row.pass_case for row in validation_rows) if validation_rows else False,
+        best_so_far_summary=summary,
+        resume_cursor=resume_cursor,
+        min_excess_return=min_excess,
+        average_excess_return=average_excess,
+        average_drawdown_advantage=drawdown_advantage,
+        average_win_rate=average_win_rate,
+        failing_cases=failing_cases,
+    )
+
+
+def _evaluation_sort_key(result: OptimizerEvaluation) -> tuple[float, float, float, float, int]:
+    fail_count = sum(not row.pass_case for row in result.validation_rows)
+    return (
+        result.min_excess_return,
+        result.average_excess_return,
+        result.average_drawdown_advantage,
+        result.average_win_rate,
+        -fail_count,
+    )
+
+
+def generate_coarse_candidates(budget_name: str) -> list[RuleStrategyConfig]:
+    spec = SEARCH_BUDGET_SPECS[budget_name]
+    candidates: list[RuleStrategyConfig] = []
+    for fast in spec["coarse_fast"]:
+        for slow in spec["coarse_slow"]:
+            if fast >= slow:
+                continue
+            for bottom_required in spec["bottom_votes"]:
+                for buy_votes in spec["buy_votes"]:
+                    for sell_votes in spec["sell_votes"]:
+                        for buy_threshold in spec["buy_thresholds"]:
+                            for sell_threshold in spec["sell_thresholds"]:
+                                for need_macd, need_volume, allow_reclaim in spec["toggle_options"]:
+                                    candidates.append(
+                                        RuleStrategyConfig(
+                                            fast_ema=int(fast),
+                                            slow_ema=int(slow),
+                                            bottom_required=int(bottom_required),
+                                            buy_confirmation_required=int(buy_votes),
+                                            sell_confirmation_required=int(sell_votes),
+                                            buy_score_threshold=int(buy_threshold),
+                                            sell_score_threshold=int(sell_threshold),
+                                            require_macd_for_buy=bool(need_macd),
+                                            require_volume_for_buy=bool(need_volume),
+                                            allow_reclaim_trigger=bool(allow_reclaim),
+                                        )
+                                    )
+    unique: dict[str, RuleStrategyConfig] = {candidate.config_hash(): candidate for candidate in candidates}
+    return list(unique.values())
+
+
+def _neighboring_values(options: tuple[int, ...], value: int) -> list[int]:
+    index = options.index(value)
+    candidates = {value}
+    if index > 0:
+        candidates.add(int(options[index - 1]))
+    if index + 1 < len(options):
+        candidates.add(int(options[index + 1]))
+    return sorted(candidates)
+
+
+def generate_local_candidates(top_results: list[OptimizerEvaluation], budget_name: str) -> list[RuleStrategyConfig]:
+    if not top_results:
+        return []
+    spec = SEARCH_BUDGET_SPECS[budget_name]
+    top_n = int(spec["local_top_n"])
+    configs = [result.config for result in sorted(top_results, key=_evaluation_sort_key, reverse=True)[:top_n]]
+    buy_threshold_neighbors = lambda value: sorted({max(44, value - 6), max(44, value - 3), value, min(78, value + 3), min(78, value + 6)})
+    sell_threshold_neighbors = lambda value: sorted({max(42, value - 6), max(42, value - 3), value, min(76, value + 3), min(76, value + 6)})
+
+    local_candidates: dict[str, RuleStrategyConfig] = {}
+    for config in configs:
+        for fast in _neighboring_values(EMA_FAST_OPTIONS, config.fast_ema):
+            for slow in _neighboring_values(EMA_SLOW_OPTIONS, config.slow_ema):
+                if fast >= slow:
+                    continue
+                for bottom_required in sorted({2, 3, config.bottom_required}):
+                    for buy_votes in sorted({1, 2, 3, config.buy_confirmation_required}):
+                        for sell_votes in sorted({1, 2, 3, config.sell_confirmation_required}):
+                            for buy_threshold in buy_threshold_neighbors(config.buy_score_threshold):
+                                for sell_threshold in sell_threshold_neighbors(config.sell_score_threshold):
+                                    for need_macd in {config.require_macd_for_buy, not config.require_macd_for_buy}:
+                                        for need_volume in {config.require_volume_for_buy, not config.require_volume_for_buy}:
+                                            for allow_reclaim in {config.allow_reclaim_trigger, not config.allow_reclaim_trigger}:
+                                                candidate = RuleStrategyConfig(
+                                                    fast_ema=int(fast),
+                                                    slow_ema=int(slow),
+                                                    bottom_required=int(bottom_required),
+                                                    buy_confirmation_required=int(min(3, max(1, buy_votes))),
+                                                    sell_confirmation_required=int(min(3, max(1, sell_votes))),
+                                                    buy_score_threshold=int(buy_threshold),
+                                                    sell_score_threshold=int(sell_threshold),
+                                                    require_macd_for_buy=bool(need_macd),
+                                                    require_volume_for_buy=bool(need_volume),
+                                                    allow_reclaim_trigger=bool(allow_reclaim),
+                                                )
+                                                local_candidates[candidate.config_hash()] = candidate
+    values = list(local_candidates.values())
+    local_limit = spec.get("local_limit")
+    if local_limit is not None:
+        return values[: int(local_limit)]
+    return values
+
+
+def create_optimizer_state(budget_name: str) -> RuleOptimizerState:
+    coarse_candidates = generate_coarse_candidates(budget_name)
+    return RuleOptimizerState(
+        budget_name=budget_name,
+        stage="coarse",
+        resume_cursor=0,
+        coarse_candidates=coarse_candidates,
+        local_candidates=[],
+        top_results=[],
+        best_result=None,
+        best_so_far_summary={},
+        evaluated_candidates=0,
+        total_candidates=len(coarse_candidates),
+        completed=False,
+        last_message=f"Initialized {len(coarse_candidates)} coarse candidates.",
+        last_updated=time.strftime("%H:%M:%S"),
+    )
+
+
+def _update_optimizer_best(state: RuleOptimizerState, evaluation: OptimizerEvaluation) -> None:
+    state.top_results.append(evaluation)
+    state.top_results = sorted(state.top_results, key=_evaluation_sort_key, reverse=True)[:12]
+    if state.best_result is None or _evaluation_sort_key(evaluation) > _evaluation_sort_key(state.best_result):
+        state.best_result = evaluation
+        state.best_so_far_summary = evaluation.best_so_far_summary
+
+
+def run_optimizer_batch(
+    state: RuleOptimizerState,
+    core_indicator_frames: dict[str, pd.DataFrame],
+    preset: SignalPreset,
+) -> RuleOptimizerState:
+    if state.completed:
+        return state
+
+    batch_size = int(SEARCH_BUDGET_SPECS[state.budget_name]["batch_size"])
+    if state.stage == "coarse":
+        candidates = state.coarse_candidates
+    elif state.stage == "local":
+        candidates = state.local_candidates
+    else:
+        candidates = []
+
+    if state.stage in {"coarse", "local"}:
+        end_cursor = min(len(candidates), state.resume_cursor + batch_size)
+        for offset, config in enumerate(candidates[state.resume_cursor:end_cursor], start=1):
+            evaluation = validate_rule_strategy_config(
+                core_indicator_frames,
+                config,
+                preset,
+                resume_cursor=state.resume_cursor + offset,
+            )
+            state.evaluated_candidates += 1
+            _update_optimizer_best(state, evaluation)
+        state.resume_cursor = end_cursor
+        state.last_updated = time.strftime("%H:%M:%S")
+        if state.resume_cursor >= len(candidates):
+            if state.stage == "coarse":
+                state.local_candidates = generate_local_candidates(state.top_results, state.budget_name)
+                state.total_candidates += len(state.local_candidates)
+                state.stage = "local" if state.local_candidates else "retest"
+                state.resume_cursor = 0
+                state.last_message = f"Coarse search complete. Generated {len(state.local_candidates)} local candidates."
+            else:
+                state.stage = "retest"
+                state.resume_cursor = 0
+                state.last_message = "Local refinement complete. Running robustness retest on best configuration."
+        else:
+            state.last_message = f"Processed {state.resume_cursor}/{len(candidates)} {state.stage} candidates."
+        return state
+
+    if state.stage == "retest":
+        if state.best_result is not None:
+            retested = validate_rule_strategy_config(
+                core_indicator_frames,
+                state.best_result.config,
+                preset,
+                resume_cursor=state.resume_cursor,
+            )
+            state.best_result = retested
+            state.best_so_far_summary = retested.best_so_far_summary
+            state.last_message = "Robustness retest completed for current best configuration."
+        else:
+            state.last_message = "No valid optimizer result was available for retest."
+        state.completed = True
+        state.last_updated = time.strftime("%H:%M:%S")
+        return state
+
+    return state
+
+
+def render_header(macro_data: dict[str, Any], snapshots: list[TickerSnapshot], optimizer_state: RuleOptimizerState | None) -> None:
     latest_as_of = max(snapshot.as_of for snapshot in snapshots).date().isoformat() if snapshots else "n/a"
+    optimizer_status = "UNSOLVED / keep searching"
+    if optimizer_state and optimizer_state.best_result and optimizer_state.best_result.passed:
+        optimizer_status = "SOLVED"
     warning_text = ""
     if macro_data.get("warning"):
         warning_text = " Macro model is using a neutral fallback for unavailable fields."
@@ -4100,28 +2597,38 @@ def render_header(macro_data: dict[str, Any], snapshots: list[TickerSnapshot]) -
         f"""
         <div class="hero">
             <h1>{APP_TITLE}</h1>
-            <p>Latest completed daily bar: {latest_as_of} | Macro Fear & Greed: {macro_data['latest_label']} ({macro_data['latest_score']:.0f}) | yfinance-only deployment path.{warning_text}</p>
+            <p>Latest completed daily bar: {latest_as_of} | Macro Fear & Greed: {macro_data['latest_label']} ({macro_data['latest_score']:.0f}) | Core status: {optimizer_status}.{warning_text}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_top_metrics(watchlist_frame: pd.DataFrame, macro_data: dict[str, Any], preset: SignalPreset) -> None:
+def render_top_metrics(
+    watchlist_frame: pd.DataFrame,
+    macro_data: dict[str, Any],
+    optimizer_state: RuleOptimizerState | None,
+    active_config: RuleStrategyConfig,
+) -> None:
     strong_buy = int((watchlist_frame["state"] == "Strong Buy").sum()) if not watchlist_frame.empty else 0
     buy_count = int((watchlist_frame["state"] == "Buy").sum()) if not watchlist_frame.empty else 0
     strong_sell = int((watchlist_frame["state"] == "Strong Sell").sum()) if not watchlist_frame.empty else 0
     sell_count = int((watchlist_frame["state"] == "Sell").sum()) if not watchlist_frame.empty else 0
-    avg_buy = float(watchlist_frame["buy_score"].mean()) if not watchlist_frame.empty else 0.0
+    solved = bool(optimizer_state and optimizer_state.best_result and optimizer_state.best_result.passed)
+    passed_cases = 0
+    total_cases = 12
+    if optimizer_state and optimizer_state.best_result:
+        passed_cases = int(sum(row.pass_case for row in optimizer_state.best_result.validation_rows))
+        total_cases = int(len(optimizer_state.best_result.validation_rows))
     cards = st.columns(4)
     with cards[0]:
         render_metric_card("Macro Fear & Greed", f"{macro_data['latest_score']:.0f}", macro_data["latest_label"])
     with cards[1]:
-        render_metric_card("Buy Bias", str(strong_buy + buy_count), f"Strong {strong_buy} / Buy {buy_count}")
+        render_metric_card("Core Status", "SOLVED" if solved else "UNSOLVED", f"{passed_cases}/{total_cases} validation cases passed")
     with cards[2]:
-        render_metric_card("Sell Bias", str(strong_sell + sell_count), f"Strong {strong_sell} / Sell {sell_count}")
+        render_metric_card("Watchlist Bias", str(strong_buy + buy_count), f"Buy {strong_buy + buy_count} / Sell {strong_sell + sell_count}")
     with cards[3]:
-        render_metric_card("Average BuyScore", f"{avg_buy:.0f}", f"Watch threshold {preset.watch_threshold}")
+        render_metric_card("Active EMA Pair", f"{active_config.fast_ema}/{active_config.slow_ema}", f"Config {active_config.config_hash()}")
 
 
 def render_watchlist_summary(watchlist_frame: pd.DataFrame) -> None:
@@ -4150,6 +2657,7 @@ def render_watchlist_summary(watchlist_frame: pd.DataFrame) -> None:
             "warning",
         ],
     ].copy()
+    display["scope"] = display["ticker"].map(lambda value: "Guaranteed core" if str(value).upper() in CORE_TICKER_SET else "Exploratory only")
     display.columns = [
         "Ticker",
         "Resolved",
@@ -4166,6 +2674,7 @@ def render_watchlist_summary(watchlist_frame: pd.DataFrame) -> None:
         "FearGreed",
         "StopDistance",
         "Warning",
+        "Scope",
     ]
     display["Close"] = display["Close"].map(_format_float)
     display["1D Return"] = display["1D Return"].map(_format_pct)
@@ -4186,35 +2695,131 @@ def render_warning_panel(warnings: list[str]) -> None:
             st.warning(message)
 
 
+def render_optimizer_status(optimizer_state: RuleOptimizerState | None) -> None:
+    st.markdown('<div class="section-label">Optimizer Status</div>', unsafe_allow_html=True)
+    if optimizer_state is None:
+        st.info("Optimizer has not run yet. Use `Optimize` or `Resume Search` from the sidebar.")
+        return
+    best_result = optimizer_state.best_result
+    status = "SOLVED" if best_result and best_result.passed else "UNSOLVED / keep searching"
+    min_excess = _format_pct(best_result.min_excess_return if best_result else None)
+    avg_excess = _format_pct(best_result.average_excess_return if best_result else None)
+    cards = st.columns(4)
+    with cards[0]:
+        render_metric_card("Status", status, f"Stage {optimizer_state.stage} | Budget {optimizer_state.budget_name}")
+    with cards[1]:
+        render_metric_card("Evaluated", str(optimizer_state.evaluated_candidates), f"Candidate cursor {optimizer_state.resume_cursor}/{optimizer_state.total_candidates}")
+    with cards[2]:
+        render_metric_card("Best Min Excess", min_excess, "Primary optimization objective")
+    with cards[3]:
+        render_metric_card("Best Avg Excess", avg_excess, f"Updated {optimizer_state.last_updated}")
+    st.caption(optimizer_state.last_message)
+
+
+def render_best_configuration(best_result: OptimizerEvaluation | None) -> None:
+    st.markdown('<div class="section-label">Best Configuration</div>', unsafe_allow_html=True)
+    if best_result is None:
+        st.info("No configuration has been evaluated yet.")
+        return
+    display = pd.DataFrame(
+        [
+            {"Field": key, "Value": str(value)}
+            for key, value in config_to_display(best_result.config).items()
+        ]
+        + [
+            {"Field": "Passed All Cases", "Value": str(best_result.passed)},
+            {"Field": "Min Excess Return", "Value": _format_pct(best_result.min_excess_return)},
+            {"Field": "Average Excess Return", "Value": _format_pct(best_result.average_excess_return)},
+            {"Field": "Average Drawdown Advantage", "Value": _format_pct(best_result.average_drawdown_advantage)},
+            {"Field": "Average Win Rate", "Value": _format_pct(best_result.average_win_rate)},
+        ]
+    )
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
+def render_validation_matrix(best_result: OptimizerEvaluation | None) -> None:
+    st.markdown('<div class="section-label">Validation Matrix</div>', unsafe_allow_html=True)
+    if best_result is None:
+        st.info("Validation matrix will appear after the first optimizer batch.")
+        return
+    rows = [asdict(row) for row in best_result.validation_rows]
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        st.info("No validation rows were produced.")
+        return
+    frame["strategy_total_return"] = frame["strategy_total_return"].map(_format_pct)
+    frame["buy_hold_return"] = frame["buy_hold_return"].map(_format_pct)
+    frame["excess_return"] = frame["excess_return"].map(_format_pct)
+    frame["max_drawdown"] = frame["max_drawdown"].map(_format_pct)
+    frame["buy_hold_max_drawdown"] = frame["buy_hold_max_drawdown"].map(_format_pct)
+    frame["cagr"] = frame["cagr"].map(_format_pct)
+    frame["buy_hold_cagr"] = frame["buy_hold_cagr"].map(_format_pct)
+    frame["win_rate"] = frame["win_rate"].map(_format_pct)
+    frame = frame.rename(
+        columns={
+            "ticker": "Ticker",
+            "window": "Window",
+            "start_date": "Start",
+            "end_date": "End",
+            "strategy_total_return": "Strategy Total",
+            "buy_hold_return": "Buy & Hold",
+            "excess_return": "Excess",
+            "max_drawdown": "Strategy MDD",
+            "buy_hold_max_drawdown": "Hold MDD",
+            "cagr": "Strategy CAGR",
+            "buy_hold_cagr": "Hold CAGR",
+            "win_rate": "Win Rate",
+            "closed_trades": "Closed Trades",
+            "pass_case": "Pass",
+            "fail_reason": "Fail Reason",
+        }
+    )
+    st.dataframe(frame, width="stretch", hide_index=True)
+
+
+def render_failing_cases(best_result: OptimizerEvaluation | None) -> None:
+    st.markdown('<div class="section-label">Failing Cases</div>', unsafe_allow_html=True)
+    if best_result is None:
+        st.info("No failing-case diagnostics yet.")
+        return
+    failing = [item for item in best_result.failing_cases if item]
+    if not failing:
+        st.success("All validation cases passed.")
+        return
+    for item in failing:
+        st.warning(item)
+
+
 def render_signal_review(event_frame: pd.DataFrame, trade_frame: pd.DataFrame, summary: dict[str, float | int | None]) -> None:
     st.markdown('<div class="section-label">Historical Signal Replay</div>', unsafe_allow_html=True)
-    st.caption(
-        "Signals below replay the same rule set through history. This is a rule-based timing review, not a broker-grade fill simulator."
-    )
+    st.caption("Signals below replay the same rule set through history with fixed transaction costs.")
 
     avg_hold_days = "n/a" if summary["avg_hold_days"] is None else f"{summary['avg_hold_days']:.0f}d"
-    cards = st.columns(6)
-    with cards[0]:
+    cards_top = st.columns(6)
+    with cards_top[0]:
         render_metric_card("Closed Trades", str(summary["closed_trades"]), "Completed round trips")
-    with cards[1]:
+    with cards_top[1]:
         render_metric_card("Win Rate", _format_pct(summary["win_rate"]), "Closed trades only")
-    with cards[2]:
+    with cards_top[2]:
         render_metric_card("Avg Closed Return", _format_pct(summary["avg_closed_return"]), "Closed trades only")
-    with cards[3]:
+    with cards_top[3]:
         render_metric_card("Median Return", _format_pct(summary["median_closed_return"]), "Closed trades only")
-    with cards[4]:
+    with cards_top[4]:
         render_metric_card("Avg Hold", avg_hold_days, "Closed trades only")
-    with cards[5]:
-        open_caption = "No open simulated position" if summary["open_trade_return"] is None else "Current mark-to-market"
-        render_metric_card("Open Trade", _format_pct(summary["open_trade_return"]), open_caption)
+    with cards_top[5]:
+        render_metric_card("Cost Drag", _format_pct(summary.get("cost_drag")), "Cumulative strategy costs")
 
-    benchmark_cards = st.columns(3)
-    with benchmark_cards[0]:
-        render_metric_card("Strategy Total", _format_pct(summary.get("strategy_total_return")), "Compounded closed + open trade")
-    with benchmark_cards[1]:
-        render_metric_card("Buy & Hold", _format_pct(summary.get("buy_hold_return")), "First close to latest close")
-    with benchmark_cards[2]:
-        render_metric_card("Alpha vs Hold", _format_pct(summary.get("excess_return")), "Strategy total minus buy & hold")
+    cards_bottom = st.columns(5)
+    with cards_bottom[0]:
+        render_metric_card("Strategy Total", _format_pct(summary.get("strategy_total_return")), "Net of costs")
+    with cards_bottom[1]:
+        render_metric_card("Buy & Hold", _format_pct(summary.get("buy_hold_return")), "Net of costs")
+    with cards_bottom[2]:
+        render_metric_card("Alpha vs Hold", _format_pct(summary.get("excess_return")), "Strategy minus hold")
+    with cards_bottom[3]:
+        render_metric_card("Max Drawdown", _format_pct(summary.get("max_drawdown")), "Strategy equity curve")
+    with cards_bottom[4]:
+        render_metric_card("CAGR", _format_pct(summary.get("cagr")), "Strategy equity curve")
 
     left, right = st.columns([1.25, 1.0])
     with left:
@@ -4247,77 +2852,6 @@ def render_signal_review(event_frame: pd.DataFrame, trade_frame: pd.DataFrame, s
             )
 
 
-def render_strategy_comparison(comparison: dict[str, Any], selection_frame: pd.DataFrame) -> None:
-    if not comparison:
-        return
-    rule_summary = comparison.get("rule_summary", {})
-    ml_summary = comparison.get("ml_summary", {})
-    if not rule_summary and not ml_summary:
-        return
-
-    st.markdown('<div class="section-label">Rule vs ML Filter</div>', unsafe_allow_html=True)
-    comparison_frame = pd.DataFrame(
-        [
-            {
-                "Metric": "Closed Trades",
-                "Rule Only": rule_summary.get("closed_trades"),
-                "ML Filter": ml_summary.get("closed_trades"),
-            },
-            {
-                "Metric": "Strategy Total",
-                "Rule Only": _format_pct(rule_summary.get("strategy_total_return")),
-                "ML Filter": _format_pct(ml_summary.get("strategy_total_return")),
-            },
-            {
-                "Metric": "Buy & Hold",
-                "Rule Only": _format_pct(rule_summary.get("buy_hold_return")),
-                "ML Filter": _format_pct(ml_summary.get("buy_hold_return")),
-            },
-            {
-                "Metric": "Alpha vs Hold",
-                "Rule Only": _format_pct(rule_summary.get("excess_return")),
-                "ML Filter": _format_pct(ml_summary.get("excess_return")),
-            },
-            {
-                "Metric": "Win Rate",
-                "Rule Only": _format_pct(rule_summary.get("win_rate")),
-                "ML Filter": _format_pct(ml_summary.get("win_rate")),
-            },
-            {
-                "Metric": "Avg Closed Return",
-                "Rule Only": _format_pct(rule_summary.get("avg_closed_return")),
-                "ML Filter": _format_pct(ml_summary.get("avg_closed_return")),
-            },
-            {
-                "Metric": "Median Return",
-                "Rule Only": _format_pct(rule_summary.get("median_closed_return")),
-                "ML Filter": _format_pct(ml_summary.get("median_closed_return")),
-            },
-            {
-                "Metric": "Open Trade",
-                "Rule Only": _format_pct(rule_summary.get("open_trade_return")),
-                "ML Filter": _format_pct(ml_summary.get("open_trade_return")),
-            },
-        ]
-    )
-    st.dataframe(comparison_frame, width="stretch", hide_index=True)
-    st.caption(
-        "OOS threshold selection: "
-        f"buy >= {comparison.get('buy_threshold', 0.0):.2f}, "
-        f"sell >= {comparison.get('sell_threshold', 0.0):.2f}, "
-        f"sell veto = {comparison.get('sell_veto_profile', ML_DEFAULT_SELL_VETO_PROFILE)}"
-    )
-    if not selection_frame.empty:
-        with st.expander("Walk-forward fold selections", expanded=False):
-            display = selection_frame.copy()
-            display["WinRate"] = display["WinRate"].map(_format_pct)
-            display["StrategyTotalReturn"] = display["StrategyTotalReturn"].map(_format_pct)
-            display["BuyHoldReturn"] = display["BuyHoldReturn"].map(_format_pct)
-            display["ExcessReturn"] = display["ExcessReturn"].map(_format_pct)
-            display["AvgClosedReturn"] = display["AvgClosedReturn"].map(_format_pct)
-            st.dataframe(display, width="stretch", hide_index=True)
-
-
 def render_ticker_panel(
     selected_ticker: str,
     snapshot: TickerSnapshot,
@@ -4326,16 +2860,16 @@ def render_ticker_panel(
     event_frame: pd.DataFrame,
     trade_frame: pd.DataFrame,
     replay_summary: dict[str, float | int | None],
-    preset: SignalPreset,
-    comparison: dict[str, Any] | None = None,
-    selection_frame: pd.DataFrame | None = None,
+    active_config: RuleStrategyConfig,
 ) -> None:
     st.markdown('<div class="section-label">Ticker Drill-down</div>', unsafe_allow_html=True)
     latest = state_frame.dropna(subset=["Close"]).iloc[-1]
     display_label = format_snapshot_label(snapshot)
+    if selected_ticker.upper() not in CORE_TICKER_SET:
+        st.info(f"{selected_ticker} is analyzed with the same rule engine, but hold-beat completion is guaranteed only for {', '.join(CORE_TICKERS)}.")
     left, right = st.columns([1.65, 1.0])
     with left:
-        st.plotly_chart(build_price_context_figure(display_label, state_frame, chart_signal_frame, preset), width="stretch", config={"displaylogo": False})
+        st.plotly_chart(build_price_context_figure(display_label, state_frame, chart_signal_frame, DEFAULT_SIGNAL_PRESET), width="stretch", config={"displaylogo": False})
     with right:
         score_cards_top = st.columns(2)
         with score_cards_top[0]:
@@ -4345,9 +2879,9 @@ def render_ticker_panel(
 
         score_cards_bottom = st.columns(2)
         with score_cards_bottom[0]:
-            render_metric_card("BuyScore", str(snapshot.buy_score), "Composite buy score")
+            render_metric_card("BuyScore", str(snapshot.buy_score), "Bottom-fishing + confirmation")
         with score_cards_bottom[1]:
-            render_metric_card("SellScore", str(snapshot.sell_score), "Composite sell score")
+            render_metric_card("SellScore", str(snapshot.sell_score), "MA exit + confirmation")
 
         detail = pd.DataFrame(
             [
@@ -4365,19 +2899,14 @@ def render_ticker_panel(
                 {"Field": "FearGreed", "Value": _format_float(snapshot.fear_greed, 0)},
                 {"Field": "StopDistance", "Value": _format_pct(snapshot.stop_distance)},
                 {"Field": "Regime", "Value": str(latest.get("Regime", "n/a"))},
-                {"Field": "MLBuyProb", "Value": _format_float(_coerce_float(latest.get("MLBuyProb")), 3)},
-                {"Field": "MLSellProb", "Value": _format_float(_coerce_float(latest.get("MLSellProb")), 3)},
-                {"Field": "MLBuyApproved", "Value": str(bool(_coerce_bool(latest.get("MLBuyApproved"))))},
-                {"Field": "MLSellApproved", "Value": str(bool(_coerce_bool(latest.get("MLSellApproved"))))},
-                {"Field": "ModelMode", "Value": str(latest.get("ModelMode", "rules_only"))},
-                {"Field": "SellVetoProfile", "Value": str(latest.get("SellVetoProfile", ML_DEFAULT_SELL_VETO_PROFILE))},
-                {"Field": "StrategySource", "Value": str(latest.get("StrategySource", "RuleOnly"))},
+                {"Field": "EMA Pair", "Value": f"{active_config.fast_ema}/{active_config.slow_ema}"},
+                {"Field": "Config Hash", "Value": active_config.config_hash()},
+                {"Field": "Scope", "Value": "Guaranteed core" if selected_ticker.upper() in CORE_TICKER_SET else "Exploratory only"},
                 {"Field": "As Of", "Value": snapshot.as_of.date().isoformat()},
             ]
         )
         st.dataframe(detail, width="stretch", hide_index=True)
 
-    render_strategy_comparison(comparison or {}, selection_frame if selection_frame is not None else pd.DataFrame())
     render_signal_review(event_frame, trade_frame, replay_summary)
 
 
@@ -4439,9 +2968,18 @@ def synthetic_ohlcv_from_close(close: pd.Series) -> pd.DataFrame:
     return pd.DataFrame({"Open": base_open, "High": high, "Low": low, "Close": close, "Volume": volume})
 
 
+def build_test_indicator_frame(index: pd.DatetimeIndex) -> pd.DataFrame:
+    close = pd.Series(np.linspace(100, 120, len(index)), index=index)
+    frame = synthetic_ohlcv_from_close(close)
+    macro = pd.Series(50.0, index=index, name="FearGreed")
+    indicators = compute_indicators(frame, macro, close * 0.99, macro / 100.0, "SPY")
+    indicators["FearGreed"] = 50.0
+    return indicators
+
+
 def run_benchmark() -> dict[str, Any]:
     rows = 5_000
-    rng = np.random.default_rng(ML_RANDOM_STATE)
+    rng = np.random.default_rng(RANDOM_STATE)
     index = pd.date_range("2010-01-04", periods=rows, freq="B")
     close = pd.Series(300 + rng.normal(0.04, 1.9, rows).cumsum(), index=index)
     frame = synthetic_ohlcv_from_close(close)
@@ -4449,18 +2987,18 @@ def run_benchmark() -> dict[str, Any]:
     benchmark_close = close * 0.95
 
     started_at = time.perf_counter()
-    indicators = compute_indicators(frame, macro, benchmark_close, macro / 100.0, ML_TARGET_SYMBOL)
+    indicators = compute_indicators(frame, macro, benchmark_close, macro / 100.0, "QQQ")
     indicators_seconds = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    state_frame = build_state_frame(indicators, DEFAULT_SIGNAL_PRESET)
+    state_frame = build_state_frame(indicators, DEFAULT_SIGNAL_PRESET, DEFAULT_RULE_CONFIG, include_notes=False)
     state_seconds = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    _, _, replay_summary = build_trade_replay_from_state_frame(ML_TARGET_SYMBOL, attach_rule_only_columns(state_frame), DEFAULT_SIGNAL_PRESET)
+    _, _, replay_summary = build_trade_replay_from_state_frame("QQQ", state_frame, DEFAULT_SIGNAL_PRESET)
     replay_seconds = time.perf_counter() - started_at
 
-    download_symbols = list(ML_FEATURE_TICKERS[:10])
+    download_symbols = ["QQQ", "SPY", "AAPL", "MSFT"]
     sequential_started_at = time.perf_counter()
     for symbol in download_symbols:
         quiet_yfinance_download(
@@ -4484,14 +3022,11 @@ def run_benchmark() -> dict[str, Any]:
     )
     batch_seconds = time.perf_counter() - batch_started_at
 
-    baseline_state_seconds = 2.05
     return {
         "rows": rows,
         "compute_indicators_seconds": round(indicators_seconds, 4),
         "build_state_frame_seconds": round(state_seconds, 4),
-        "build_state_improvement_vs_baseline_pct": round((baseline_state_seconds - state_seconds) / baseline_state_seconds * 100.0, 2),
         "replay_seconds": round(replay_seconds, 4),
-        "download_symbols": download_symbols,
         "sequential_download_seconds": round(sequential_seconds, 4),
         "batch_download_seconds": round(batch_seconds, 4),
         "batch_speedup_x": round(sequential_seconds / batch_seconds, 2) if batch_seconds > 0 else None,
@@ -4508,7 +3043,6 @@ def run_benchmark_cli(json_output: bool = False) -> int:
     print(f"rows={benchmark['rows']}")
     print(f"compute_indicators_seconds={benchmark['compute_indicators_seconds']}")
     print(f"build_state_frame_seconds={benchmark['build_state_frame_seconds']}")
-    print(f"build_state_improvement_vs_baseline_pct={benchmark['build_state_improvement_vs_baseline_pct']}")
     print(f"replay_seconds={benchmark['replay_seconds']}")
     print(f"sequential_download_seconds={benchmark['sequential_download_seconds']}")
     print(f"batch_download_seconds={benchmark['batch_download_seconds']}")
@@ -4517,57 +3051,65 @@ def run_benchmark_cli(json_output: bool = False) -> int:
     return 0
 
 
-def run_ml_backtest(symbol: str, start_iso: str, end_iso: str) -> dict[str, Any]:
+def run_rule_backtest(symbol: str, start_iso: str, end_iso: str) -> dict[str, Any]:
     symbol = symbol.strip().upper()
     preset = DEFAULT_SIGNAL_PRESET
     macro_data = load_macro_fear_greed_cached(end_iso)
-    requested_tickers = [symbol]
-    if symbol == ML_TARGET_SYMBOL:
-        requested_tickers = dedupe_preserve_order(requested_tickers + list(ML_BATCH_TICKERS))
-    price_payloads = load_price_payloads(requested_tickers, start_iso, end_iso)
+    price_payloads = load_price_payloads([symbol], start_iso, end_iso)
     payload = price_payloads.get(symbol, {"frame": pd.DataFrame(columns=list(REQUIRED_OHLCV_COLUMNS)), "resolved_symbol": symbol, "warning": f"{symbol} payload unavailable"})
-    analysis = analyze_symbol_state(
-        symbol,
-        payload,
-        macro_data,
-        preset,
-        feature_payloads=price_payloads if symbol == ML_TARGET_SYMBOL else None,
-    )
-    final_state_frame = attach_rule_only_columns(analysis["state_frame"])
-    baseline_state_frame = attach_rule_only_columns(analysis["baseline_state_frame"])
-    ml_bundle = analysis["ml_bundle"]
-    oos_start = ml_bundle.get("oos_start") or final_state_frame.index.min()
-    final_slice = final_state_frame.loc[oos_start:].copy() if oos_start is not None else final_state_frame.copy()
-    baseline_slice = baseline_state_frame.loc[oos_start:].copy() if oos_start is not None else baseline_state_frame.copy()
-    _, _, rule_summary = build_trade_replay_from_state_frame(symbol, baseline_slice, preset)
-    _, _, ml_summary = build_trade_replay_from_state_frame(symbol, final_slice, preset)
+    analysis = analyze_symbol_state(symbol, payload, macro_data, preset, DEFAULT_RULE_CONFIG)
+    state_frame = analysis["state_frame"]
+    _, _, summary = build_trade_replay_from_state_frame(symbol, state_frame, preset)
     return {
         "symbol": symbol,
         "start": start_iso,
         "end": end_iso,
-        "oos_start": None if oos_start is None else pd.Timestamp(oos_start).date().isoformat(),
-        "model_mode": ml_bundle.get("model_mode", "rules_only"),
-        "sell_veto_profile": ml_bundle.get("comparison", {}).get("sell_veto_profile", ML_DEFAULT_SELL_VETO_PROFILE),
-        "ml_enabled": bool(ml_bundle.get("enabled")),
-        "reason": ml_bundle.get("reason"),
-        "rule_summary": rule_summary,
-        "ml_summary": ml_summary,
-        "selection_frame": ml_bundle.get("selection_frame", pd.DataFrame()).to_dict("records"),
+        "config": config_to_display(DEFAULT_RULE_CONFIG),
+        "summary": summary,
     }
 
 
-def run_ml_backtest_cli(symbol: str, start_iso: str, end_iso: str, json_output: bool = False) -> int:
-    result = run_ml_backtest(symbol, start_iso, end_iso)
+def run_rule_backtest_cli(symbol: str, start_iso: str, end_iso: str, json_output: bool = False) -> int:
+    result = run_rule_backtest(symbol, start_iso, end_iso)
     if json_output:
         print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
         return 0
-    print("ML_BACKTEST")
-    print(f"symbol={result['symbol']}")
-    print(f"start={result['start']} end={result['end']} oos_start={result['oos_start']}")
-    print(f"model_mode={result['model_mode']} sell_veto_profile={result['sell_veto_profile']} ml_enabled={result['ml_enabled']}")
-    print(f"reason={result['reason']}")
-    print(f"rule_summary={result['rule_summary']}")
-    print(f"ml_summary={result['ml_summary']}")
+    print("RULE_BACKTEST")
+    print(f"symbol={result['symbol']} start={result['start']} end={result['end']}")
+    print(f"config={result['config']}")
+    print(f"summary={result['summary']}")
+    return 0
+
+
+def run_optimize_report(end_iso: str, budget_name: str) -> dict[str, Any]:
+    inputs = load_core_indicator_inputs(end_iso)
+    state = create_optimizer_state(budget_name)
+    while not state.completed:
+        state = run_optimizer_batch(state, inputs["indicator_frames"], DEFAULT_SIGNAL_PRESET)
+    best_result = state.best_result
+    return {
+        "budget": budget_name,
+        "completed": state.completed,
+        "evaluated_candidates": state.evaluated_candidates,
+        "best_config": config_to_display(best_result.config) if best_result else None,
+        "best_summary": best_result.best_so_far_summary if best_result else {},
+        "passed": bool(best_result and best_result.passed),
+        "validation_rows": [asdict(row) for row in best_result.validation_rows] if best_result else [],
+        "failing_cases": list(best_result.failing_cases) if best_result else [],
+    }
+
+
+def run_optimize_report_cli(end_iso: str, budget_name: str, json_output: bool = False) -> int:
+    result = run_optimize_report(end_iso, budget_name)
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+        return 0
+    print("OPTIMIZE_REPORT")
+    print(f"budget={result['budget']} completed={result['completed']} evaluated_candidates={result['evaluated_candidates']}")
+    print(f"best_config={result['best_config']}")
+    print(f"best_summary={result['best_summary']}")
+    print(f"passed={result['passed']}")
+    print(f"failing_cases={result['failing_cases']}")
     return 0
 
 
@@ -4585,15 +3127,6 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
         record("td_buy_exhaustion", passed, f"max BuySetup={int(down_td['BuySetup'].max())}, max BuyCountdown={int(down_td['BuyCountdown'].max())}")
     except Exception as exc:
         record("td_buy_exhaustion", False, str(exc))
-
-    try:
-        up_close = pd.Series(np.linspace(100, 200, 80), index=pd.date_range("2023-01-02", periods=80, freq="B"))
-        up_frame = synthetic_ohlcv_from_close(up_close)
-        up_td = compute_td_sequential(up_frame)
-        passed = int(up_td["SellSetup"].max()) >= 9 and int(up_td["SellCountdown"].max()) >= 13
-        record("td_sell_exhaustion", passed, f"max SellSetup={int(up_td['SellSetup'].max())}, max SellCountdown={int(up_td['SellCountdown'].max())}")
-    except Exception as exc:
-        record("td_sell_exhaustion", False, str(exc))
 
     try:
         x_axis = np.linspace(0, 10 * np.pi, 320)
@@ -4614,35 +3147,95 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
         record("stl_cycle_extremes", False, str(exc))
 
     try:
-        trend_close = pd.Series(np.linspace(100, 160, 120), index=pd.date_range("2022-01-03", periods=120, freq="B"))
-        trend_frame = synthetic_ohlcv_from_close(trend_close)
-        indicators = compute_indicators(trend_frame, None)
-        atr_ready = indicators["ATR"].dropna()
-        stop_distance = indicators["StopDistance"].dropna()
-        stretch = indicators["ATRStretch"].dropna()
-        passed = bool((atr_ready > 0).all() and stop_distance.median() > 0 and stretch.iloc[-1] > 0)
-        record("atr_and_stop_direction", passed, f"atr_count={len(atr_ready)}, median_stop_distance={stop_distance.median():.4f}, last_stretch={stretch.iloc[-1]:.4f}")
+        idx = pd.date_range("2024-01-02", periods=40, freq="B")
+        indicators = build_test_indicator_frame(idx)
+        indicators.loc[idx[-2:], "RSI"] = [34.0, 28.0]
+        indicators.loc[idx[-2:], "CycleScore"] = [18.0, 8.0]
+        indicators.loc[idx[-2:], "FearGreed"] = [30.0, 18.0]
+        indicators.loc[idx[-2:], "MFI"] = [28.0, 20.0]
+        indicators.loc[idx[-2:], "ATRStretch"] = [-0.9, -1.4]
+        indicators.loc[idx[-2:], "BBPos20"] = [0.18, 0.08]
+        indicators.loc[idx[-2:], "BuySetup"] = [8, 9]
+        indicators.loc[idx[-2:], "BuyCountdown"] = [0, 13]
+        indicators.loc[idx[-2:], "MACDBullCross"] = [False, True]
+        indicators.loc[idx[-2:], "MACDHist"] = [-0.2, -0.05]
+        indicators.loc[idx[-2:], "MACDHistDelta"] = [0.05, 0.08]
+        indicators.loc[idx[-2:], "CMF20"] = [0.01, 0.06]
+        indicators.loc[idx[-2:], "OBVSlope10"] = [10.0, 20.0]
+        indicators.loc[idx[-2:], "VolumeDryUp"] = [True, True]
+        indicators.loc[idx[-2:], "RSPercentile"] = [55.0, 65.0]
+        indicators.loc[idx[-2:], "RSMomentum63"] = [0.01, 0.03]
+        indicators.loc[idx[-2:], "EMA8"] = [100.0, 103.0]
+        indicators.loc[idx[-2:], "EMA50"] = [101.0, 102.0]
+        indicators.loc[idx[-2:], "Close"] = [101.5, 104.0]
+        indicators.loc[idx[-2:], "ChandelierStop"] = [95.0, 96.0]
+        indicators.loc[idx[-2:], "StopCloseBreach"] = [False, False]
+        indicators.loc[idx[-2:], "StopTouched"] = [False, False]
+        state = build_state_frame(indicators, DEFAULT_SIGNAL_PRESET, DEFAULT_RULE_CONFIG, include_notes=False)
+        latest = state.iloc[-1]
+        passed = bool(int(latest["BottomVotes"]) == 3 and bool(latest["BuySetupActive"]) and bool(latest["BuyTrigger"]))
+        record("bottom_setup_detection", passed, f"bottom_votes={int(latest['BottomVotes'])}, buy_trigger={bool(latest['BuyTrigger'])}")
     except Exception as exc:
-        record("atr_and_stop_direction", False, str(exc))
+        record("bottom_setup_detection", False, str(exc))
 
     try:
-        momentum_index = pd.date_range("2023-01-02", periods=100, freq="B")
-        up_momentum = calc_13612w_momentum(pd.Series(np.linspace(100, 130, 100), index=momentum_index)).dropna()
-        down_momentum = calc_13612w_momentum(pd.Series(np.linspace(130, 100, 100), index=momentum_index)).dropna()
-        passed = bool(not up_momentum.empty and not down_momentum.empty and up_momentum.iloc[-1] > 0 and down_momentum.iloc[-1] < 0)
-        record("tips_13612w_momentum_sign", passed, f"up_last={up_momentum.iloc[-1]:.4f}, down_last={down_momentum.iloc[-1]:.4f}")
+        idx = pd.date_range("2024-02-01", periods=30, freq="B")
+        indicators = build_test_indicator_frame(idx)
+        indicators.loc[idx[-5:-3], "RSI"] = [34.0, 29.0]
+        indicators.loc[idx[-5:-3], "CycleScore"] = [16.0, 9.0]
+        indicators.loc[idx[-5:-3], "FearGreed"] = [32.0, 20.0]
+        indicators.loc[idx[-5:-3], "MFI"] = [30.0, 22.0]
+        indicators.loc[idx[-5:-3], "ATRStretch"] = [-0.8, -1.1]
+        indicators.loc[idx[-5:-3], "BBPos20"] = [0.15, 0.10]
+        indicators.loc[idx[-5:-3], "BuySetup"] = [8, 9]
+        indicators.loc[idx[-5:-3], "BuyCountdown"] = [0, 13]
+        indicators.loc[idx[-5:-3], "MACDBullCross"] = [False, True]
+        indicators.loc[idx[-5:-3], "MACDHist"] = [-0.18, -0.04]
+        indicators.loc[idx[-5:-3], "MACDHistDelta"] = [0.04, 0.07]
+        indicators.loc[idx[-5:-3], "CMF20"] = [0.02, 0.06]
+        indicators.loc[idx[-5:-3], "OBVSlope10"] = [8.0, 18.0]
+        indicators.loc[idx[-5:-3], "VolumeDryUp"] = [True, True]
+        indicators.loc[idx[-5:-3], "RSPercentile"] = [54.0, 63.0]
+        indicators.loc[idx[-5:-3], "RSMomentum63"] = [0.01, 0.03]
+        indicators.loc[idx[-5:-3], "EMA8"] = [100.0, 103.0]
+        indicators.loc[idx[-5:-3], "EMA50"] = [101.0, 102.0]
+        indicators.loc[idx[-5:-3], "Close"] = [101.5, 104.0]
+        indicators.loc[idx[-5:-3], "ChandelierStop"] = [95.0, 96.0]
+        indicators.loc[idx[-5:-3], "StopCloseBreach"] = [False, False]
+        indicators.loc[idx[-5:-3], "StopTouched"] = [False, False]
+        indicators.loc[idx[-2:], "EMA8"] = [104.0, 101.0]
+        indicators.loc[idx[-2:], "EMA50"] = [103.0, 102.0]
+        indicators.loc[idx[-2:], "Close"] = [103.0, 99.0]
+        indicators.loc[idx[-2:], "RSI"] = [68.0, 72.0]
+        indicators.loc[idx[-2:], "FearGreed"] = [62.0, 68.0]
+        indicators.loc[idx[-2:], "SellSetup"] = [8, 9]
+        indicators.loc[idx[-2:], "SellCountdown"] = [0, 13]
+        indicators.loc[idx[-2:], "MACDBearCross"] = [False, True]
+        indicators.loc[idx[-2:], "MACDHist"] = [0.15, 0.02]
+        indicators.loc[idx[-2:], "MACDHistDelta"] = [-0.04, -0.06]
+        indicators.loc[idx[-2:], "CMF20"] = [-0.01, -0.06]
+        indicators.loc[idx[-2:], "OBVSlope10"] = [-4.0, -12.0]
+        indicators.loc[idx[-2:], "ATRStretch"] = [0.8, 1.1]
+        indicators.loc[idx[-2:], "BBPos20"] = [0.8, 0.95]
+        indicators.loc[idx[-2:], "ChandelierStop"] = [97.0, 96.0]
+        indicators.loc[idx[-2:], "StopCloseBreach"] = [False, False]
+        indicators.loc[idx[-2:], "StopTouched"] = [False, False]
+        state = build_state_frame(indicators, DEFAULT_SIGNAL_PRESET, DEFAULT_RULE_CONFIG, include_notes=False)
+        latest = state.iloc[-1]
+        passed = bool(latest["SellTrigger"] and latest["State"] in {"Sell", "Strong Sell"})
+        record("ema_bearish_trigger", passed, f"sell_trigger={bool(latest['SellTrigger'])}, state={latest['State']}")
     except Exception as exc:
-        record("tips_13612w_momentum_sign", False, str(exc))
+        record("ema_bearish_trigger", False, str(exc))
 
     try:
-        preset = PROFILE_PRESETS["Balanced"]
-        replay_index = pd.date_range("2024-01-02", periods=6, freq="B")
+        preset = DEFAULT_SIGNAL_PRESET
+        replay_index = pd.date_range("2024-03-01", periods=6, freq="B")
         replay_state = pd.DataFrame(
             {
-                "Close": [100.0, 101.0, 103.0, 110.0, 107.0, 98.0],
+                "Close": [100.0, 101.0, 104.0, 110.0, 107.0, 99.0],
                 "ChandelierStop": [90.0, 91.0, 92.0, 94.0, 95.0, 100.0],
                 "State": ["Hold / Neutral", "Strong Buy", "Buy", "Weak Sell", "Hold / Neutral", "Strong Sell"],
-                "BuyScore": [15, 81, 78, 34, 30, 20],
+                "BuyScore": [15, 80, 78, 34, 30, 20],
                 "SellScore": [18, 20, 25, 62, 40, 82],
                 "BuyTrigger": [False, True, False, False, False, False],
                 "SellTrigger": [False, False, False, False, False, True],
@@ -4651,85 +3244,52 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
             },
             index=replay_index,
         )
-        events, trades, _ = build_trade_replay_from_state_frame("TEST", replay_state, preset)
-        expected_signals = ["BUY", "PARTIAL SELL", "SELL"]
-        passed = (events["Signal"].tolist() == expected_signals) and (len(trades) == 1) and (trades.iloc[0]["Status"] == "Closed")
-        record("replay_sequence", passed, f"signals={events['Signal'].tolist()}")
+        _, _, net_summary = build_trade_replay_from_state_frame("TEST", replay_state, preset, transaction_cost=TRANSACTION_COST_PER_SIDE)
+        _, _, gross_summary = build_trade_replay_from_state_frame("TEST", replay_state, preset, transaction_cost=0.0)
+        passed = bool(
+            net_summary["strategy_total_return"] is not None
+            and gross_summary["strategy_total_return"] is not None
+            and float(net_summary["strategy_total_return"]) < float(gross_summary["strategy_total_return"])
+            and float(net_summary["cost_drag"] or 0.0) > 0.0
+        )
+        record(
+            "transaction_cost_application",
+            passed,
+            f"net={net_summary['strategy_total_return']}, gross={gross_summary['strategy_total_return']}, cost_drag={net_summary['cost_drag']}",
+        )
     except Exception as exc:
-        record("replay_sequence", False, str(exc))
+        record("transaction_cost_application", False, str(exc))
 
     try:
-        preset = PROFILE_PRESETS["Aggressive"]
-        cooldown_index = pd.date_range("2024-03-01", periods=6, freq="B")
-        cooldown_state = pd.DataFrame(
-            {
-                "Close": [100.0, 98.0, 99.0, 101.0, 102.0, 103.0],
-                "ChandelierStop": [90.0, 99.0, 90.0, 90.0, 90.0, 90.0],
-                "State": ["Strong Buy", "Strong Sell", "Buy", "Hold / Neutral", "Strong Buy", "Hold / Neutral"],
-                "BuyScore": [80, 20, 78, 30, 82, 25],
-                "SellScore": [20, 84, 25, 25, 20, 20],
-                "BuyTrigger": [True, False, True, False, True, False],
-                "SellTrigger": [False, True, False, False, False, False],
-                "SellSetupActive": [False, True, False, False, False, False],
-                "SignalNote": ["n"] * 6,
-            },
-            index=cooldown_index,
-        )
-        events, _, _ = build_trade_replay_from_state_frame("TEST2", cooldown_state, preset)
-        signals = events["Signal"].tolist()
-        passed = signals == ["BUY", "SELL", "BUY"] and signals.count("SELL") == 1
-        record("replay_cooldown_and_orphan_guard", passed, f"signals={signals}")
+        failed_summary = {
+            "excess_return": 0.02,
+            "win_rate": 0.34,
+            "closed_trades": 4,
+            "max_drawdown": 0.25,
+            "buy_hold_max_drawdown": 0.10,
+        }
+        passed_flag, reason = _assess_validation_case("3Y", failed_summary)
+        passed = (not passed_flag) and bool(reason)
+        record("optimizer_guardrail_rejection", passed, f"passed={passed_flag}, reason={reason}")
     except Exception as exc:
-        record("replay_cooldown_and_orphan_guard", False, str(exc))
+        record("optimizer_guardrail_rejection", False, str(exc))
 
     try:
-        preset = PROFILE_PRESETS["Balanced"]
-        whipsaw_index = pd.date_range("2024-05-01", periods=6, freq="B")
-        whipsaw_state = pd.DataFrame(
-            {
-                "Close": [100.0, 102.0, 101.0, 100.5, 99.0, 98.0],
-                "Low": [99.0, 101.0, 100.8, 100.0, 98.8, 97.5],
-                "ChandelierStop": [92.0, 94.0, 95.0, 95.0, 95.0, 95.0],
-                "State": ["Hold / Neutral", "Buy", "Sell", "Weak Sell", "Sell", "Strong Sell"],
-                "BuyScore": [25, 74, 45, 38, 22, 10],
-                "SellScore": [20, 18, 72, 60, 82, 92],
-                "BuyTrigger": [False, True, False, False, False, False],
-                "SellTrigger": [False, False, True, False, True, True],
-                "SellSetupActive": [False, False, True, True, True, True],
-                "StopTouched": [False, False, False, False, False, True],
-                "SignalNote": ["n"] * 6,
-            },
-            index=whipsaw_index,
-        )
-        events, _, _ = build_trade_replay_from_state_frame("WHIP", whipsaw_state, preset)
-        signals = events["Signal"].tolist()
-        first_sell_date = events.loc[events["Signal"] == "SELL", "Date"].iloc[0] if (events["Signal"] == "SELL").any() else None
-        passed = bool(signals and signals[0] == "BUY" and first_sell_date is not None and pd.Timestamp(first_sell_date) >= whipsaw_index[4])
-        record("whipsaw_guard", passed, f"signals={signals}, first_sell={first_sell_date}")
+        idx = pd.date_range("2024-01-02", periods=260, freq="B")
+        core_frames: dict[str, pd.DataFrame] = {}
+        for ticker in CORE_TICKERS:
+            close = pd.Series(100 + np.linspace(0, 50, len(idx)) + (3 * np.sin(np.linspace(0, 12, len(idx)))), index=idx)
+            frame = synthetic_ohlcv_from_close(close)
+            macro = pd.Series(50.0, index=idx)
+            indicators = compute_indicators(frame, macro, close * 0.99, macro / 100.0, ticker)
+            core_frames[ticker] = indicators
+        state = create_optimizer_state("Quick")
+        first_cursor = state.resume_cursor
+        updated = run_optimizer_batch(state, core_frames, DEFAULT_SIGNAL_PRESET)
+        passed = updated.evaluated_candidates > 0 and (updated.resume_cursor != first_cursor or updated.stage != "coarse")
+        record("resumable_search_state", passed, f"evaluated={updated.evaluated_candidates}, stage={updated.stage}, cursor={updated.resume_cursor}")
     except Exception as exc:
-        record("whipsaw_guard", False, str(exc))
-
-    try:
-        preset = PROFILE_PRESETS["Balanced"]
-        marker_index = pd.date_range("2024-04-01", periods=7, freq="B")
-        marker_state = pd.DataFrame(
-            {
-                "Close": [100.0, 101.0, 103.0, 104.0, 102.0, 97.0, 96.0],
-                "ChandelierStop": [90.0, 90.0, 91.0, 92.0, 95.0, 98.0, 99.0],
-                "State": ["Hold / Neutral", "Strong Buy", "Buy", "Weak Buy", "Hold / Neutral", "Sell", "Strong Sell"],
-                "BuyScore": [20, 80, 79, 60, 44, 18, 15],
-                "SellScore": [15, 20, 21, 30, 45, 82, 84],
-                "BuyTrigger": [False, True, False, False, False, False, False],
-                "SellTrigger": [False, False, False, False, False, True, False],
-            },
-            index=marker_index,
-        )
-        chart_signals = build_chart_signal_frame(marker_state, preset)
-        signals = chart_signals["Signal"].tolist()
-        passed = signals == ["BUY", "SELL"]
-        record("chart_signal_visibility", passed, f"signals={signals}")
-    except Exception as exc:
-        record("chart_signal_visibility", False, str(exc))
+        record("resumable_search_state", False, str(exc))
 
     try:
         plain = TickerSnapshot(
@@ -4773,166 +3333,6 @@ def run_self_tests() -> list[tuple[str, bool, str]]:
     except Exception as exc:
         record("drilldown_label_alignment", False, str(exc))
 
-    try:
-        splitter = TimeSeriesSplit(n_splits=ML_CV_SPLITS, test_size=ML_CV_TEST_SIZE, gap=ML_CV_GAP)
-        leakage_free = True
-        for train_idx, test_idx in splitter.split(np.arange(600)):
-            if int(train_idx[-1]) + ML_CV_GAP >= int(test_idx[0]):
-                leakage_free = False
-                break
-        record("timeseries_gap_no_leakage", leakage_free, f"gap={ML_CV_GAP}, leakage_free={leakage_free}")
-    except Exception as exc:
-        record("timeseries_gap_no_leakage", False, str(exc))
-
-    try:
-        label_close = pd.Series(100 + np.sin(np.linspace(0, 14, 260)).cumsum(), index=pd.date_range("2023-01-02", periods=260, freq="B"))
-        label_frame = synthetic_ohlcv_from_close(label_close)
-        macro_series = pd.Series(50.0, index=label_frame.index)
-        indicators = compute_indicators(label_frame, macro_series, label_close * 0.98, macro_series / 100.0, ML_TARGET_SYMBOL)
-        state_frame = attach_rule_only_columns(build_state_frame(indicators, DEFAULT_SIGNAL_PRESET))
-        labels = build_ml_label_frame(state_frame, DEFAULT_SIGNAL_PRESET)
-        passed = (
-            not labels.empty
-            and {"BuyCandidate", "SellCandidate", "BuyLabel", "SellLabel", "SellEdge"}.issubset(labels.columns)
-            and labels["BuyCandidate"].dtype == bool
-            and labels["SellCandidate"].dtype == bool
-        )
-        record("label_generation_stability", passed, f"buy_candidates={int(labels['BuyCandidate'].sum())}, sell_candidates={int(labels['SellCandidate'].sum())}")
-    except Exception as exc:
-        record("label_generation_stability", False, str(exc))
-
-    try:
-        descriptor = resolve_boosting_descriptor(prefer_lightgbm=False)
-        passed = descriptor.name == "hist_gradient_boosting"
-        record("fallback_model_selection", passed, f"descriptor={descriptor.name}")
-    except Exception as exc:
-        record("fallback_model_selection", False, str(exc))
-
-    try:
-        stop_index = pd.date_range("2024-06-03", periods=3, freq="B")
-        stop_state = pd.DataFrame(
-            {
-                "Close": [100.0, 98.0, 95.0],
-                "Open": [100.0, 98.5, 95.5],
-                "High": [101.0, 99.0, 96.0],
-                "Low": [99.0, 97.0, 94.0],
-                "State": ["Buy", "Strong Sell", "Strong Sell"],
-                "BuyScore": [75, 25, 20],
-                "SellScore": [20, 90, 92],
-                "BuyTrigger": [True, False, False],
-                "SellTrigger": [False, True, True],
-                "SellSetupActive": [False, True, True],
-                "StopExitConfirmed": [False, True, True],
-                "StopEmergencyExit": [False, True, True],
-                "SignalNote": ["", "", ""],
-            },
-            index=stop_index,
-        )
-        filtered = apply_ml_thresholds_to_state_frame(
-            attach_rule_only_columns(stop_state),
-            pd.Series([0.9, 0.1, 0.1], index=stop_index),
-            pd.Series([0.1, 0.1, 0.1], index=stop_index),
-            0.8,
-            0.8,
-            model_mode="random_forest",
-        )
-        passed = bool(filtered["SellTrigger"].iloc[1] and filtered["State"].iloc[1] == "Strong Sell")
-        record("hard_stop_non_rejection", passed, f"sell_trigger={filtered['SellTrigger'].iloc[1]}, state={filtered['State'].iloc[1]}")
-    except Exception as exc:
-        record("hard_stop_non_rejection", False, str(exc))
-
-    try:
-        veto_index = pd.date_range("2024-07-01", periods=3, freq="B")
-        veto_state = pd.DataFrame(
-            {
-                "Close": [100.0, 103.0, 104.5],
-                "Open": [99.8, 102.5, 104.0],
-                "High": [100.5, 103.5, 105.0],
-                "Low": [99.5, 102.0, 103.5],
-                "State": ["Buy", "Sell", "Strong Sell"],
-                "BuyScore": [74, 42, 20],
-                "SellScore": [20, 64, 86],
-                "BuyTrigger": [True, False, False],
-                "SellTrigger": [False, True, True],
-                "SellSetupActive": [False, True, True],
-                "StopExitConfirmed": [False, False, False],
-                "StopEmergencyExit": [False, False, True],
-                "Regime": ["Bull Trend", "Bull Trend", "Bull Trend"],
-                "CycleScore": [18.0, 42.0, 72.0],
-                "FearGreed": [58.0, 61.0, 61.0],
-                "RSPercentile": [88.0, 91.0, 91.0],
-                "SignalNote": ["", "", ""],
-            },
-            index=veto_index,
-        )
-        filtered = apply_ml_thresholds_to_state_frame(
-            attach_rule_only_columns(veto_state),
-            pd.Series([0.9, 0.9, 0.1], index=veto_index),
-            pd.Series([0.1, 0.9, 0.1], index=veto_index),
-            0.8,
-            0.8,
-            model_mode="random_forest",
-            sell_veto_profile="bull_cycle55",
-        )
-        passed = (
-            bool(not filtered["SellTrigger"].iloc[1])
-            and str(filtered["StrategySource"].iloc[1]) == "MLSellVeto"
-            and bool(filtered["SellTrigger"].iloc[2])
-        )
-        record(
-            "bull_sell_veto_only_blocks_discretionary_exits",
-            passed,
-            (
-                f"blocked={filtered['SellTrigger'].iloc[1]}, "
-                f"source={filtered['StrategySource'].iloc[1]}, "
-                f"hard_stop={filtered['SellTrigger'].iloc[2]}"
-            ),
-        )
-    except Exception as exc:
-        record("bull_sell_veto_only_blocks_discretionary_exits", False, str(exc))
-
-    try:
-        rows = 180
-        feature_index = pd.date_range("2023-01-02", periods=rows, freq="B")
-        feature_frame = pd.DataFrame(
-            {
-                "F1": np.linspace(-2, 2, rows),
-                "F2": np.sin(np.linspace(0, 6 * np.pi, rows)),
-                "F3": np.cos(np.linspace(0, 5 * np.pi, rows)),
-            },
-            index=feature_index,
-        )
-        candidate_mask = pd.Series(True, index=feature_index)
-        label_series = pd.Series(([0] * 90) + ([1] * 90), index=feature_index)
-        first_train, first_test, _ = build_probability_views_for_target(
-            feature_frame,
-            candidate_mask,
-            label_series,
-            feature_frame.iloc[0:0],
-            pd.Series(dtype=bool),
-            ["F1", "F2", "F3"],
-            prefer_lightgbm=False,
-        )
-        second_train, second_test, _ = build_probability_views_for_target(
-            feature_frame,
-            candidate_mask,
-            label_series,
-            feature_frame.iloc[0:0],
-            pd.Series(dtype=bool),
-            ["F1", "F2", "F3"],
-            prefer_lightgbm=False,
-        )
-        passed = all(
-            np.allclose(first_train[name], second_train[name], equal_nan=True)
-            for name in first_train
-        ) and all(
-            np.allclose(first_test[name], second_test[name], equal_nan=True)
-            for name in first_test
-        )
-        record("fixed_random_state_reproducibility", passed, "probability views stable across repeated fits")
-    except Exception as exc:
-        record("fixed_random_state_reproducibility", False, str(exc))
-
     return results
 
 
@@ -4954,8 +3354,12 @@ def main() -> None:
     run_started_at = time.perf_counter()
     configure_page()
     apply_style()
-    watchlist, history_years, preset, refresh = build_controls()
-    progress_total_steps = 2 + len(watchlist) + 2 + (1 if ML_TARGET_SYMBOL in watchlist else 0)
+    controls = build_controls()
+    watchlist = controls["watchlist"]
+    history_years = controls["history_years"]
+    preset = DEFAULT_SIGNAL_PRESET
+    should_run_optimizer = bool(controls["optimize"] or controls["resume_search"])
+    progress_total_steps = 2 + len(watchlist) + 1 + (1 if should_run_optimizer else 0)
     progress_tracker = StreamlitProgressTracker(progress_total_steps)
     timing_rows: list[dict[str, Any]] = []
 
@@ -4969,14 +3373,41 @@ def main() -> None:
             }
         )
 
-    if refresh:
+    if controls["refresh"]:
         st.cache_data.clear()
         st.sidebar.success("Cached data cleared. Rerun to fetch fresh prices.")
+    if controls["reset_search"]:
+        st.session_state.pop(OPTIMIZER_STATE_KEY, None)
+        st.sidebar.success("Optimizer search state cleared.")
 
     end_date = date.today()
     start_date = end_date - timedelta(days=(history_years * 365) + 30)
-    price_payloads: dict[str, dict[str, Any]] = {}
-    full_price_payloads: dict[str, dict[str, Any]] = {}
+    optimizer_state = st.session_state.get(OPTIMIZER_STATE_KEY)
+
+    if should_run_optimizer:
+        progress_tracker.update(
+            "Running optimizer batch",
+            f"Loading core matrix inputs through {end_date.isoformat()} with budget {controls['search_budget']}.",
+            advance=0,
+        )
+        optimizer_started_at = time.perf_counter()
+        core_inputs = load_core_indicator_inputs(end_date.isoformat())
+        if (
+            optimizer_state is None
+            or controls["optimize"]
+            or optimizer_state.budget_name != controls["search_budget"]
+        ):
+            optimizer_state = create_optimizer_state(controls["search_budget"])
+        optimizer_state = run_optimizer_batch(optimizer_state, core_inputs["indicator_frames"], preset)
+        st.session_state[OPTIMIZER_STATE_KEY] = optimizer_state
+        add_timing("optimizer_batch", "core_matrix", optimizer_started_at, optimizer_state.evaluated_candidates)
+        progress_tracker.update(
+            "Optimizer batch complete",
+            optimizer_state.last_message,
+            advance=1,
+        )
+
+    active_config = optimizer_state.best_result.config if optimizer_state and optimizer_state.best_result else DEFAULT_RULE_CONFIG
 
     try:
         progress_tracker.update(
@@ -4994,21 +3425,17 @@ def main() -> None:
         )
 
         download_started_at = time.perf_counter()
-        requested_tickers = watchlist.copy()
-        if ML_TARGET_SYMBOL in watchlist:
-            requested_tickers = dedupe_preserve_order(requested_tickers + list(ML_BATCH_TICKERS))
         progress_tracker.update(
             "Downloading price history",
-            f"Requesting {len(requested_tickers)} ticker payloads: {', '.join(requested_tickers[:8])}{' ...' if len(requested_tickers) > 8 else ''}",
+            f"Requesting {len(watchlist)} ticker payloads: {', '.join(watchlist[:8])}{' ...' if len(watchlist) > 8 else ''}",
             advance=0,
         )
-        full_price_payloads = load_price_payloads(requested_tickers, start_date.isoformat(), end_date.isoformat())
-        total_rows_downloaded = sum(len(payload.get("frame", pd.DataFrame())) for payload in full_price_payloads.values())
-        add_timing("download_batch", "watchlist_and_features", download_started_at, total_rows_downloaded)
-        price_payloads = {ticker: full_price_payloads.get(ticker, download_single_history_cached(ticker, start_date.isoformat(), end_date.isoformat())) for ticker in watchlist}
+        price_payloads = load_price_payloads(watchlist, start_date.isoformat(), end_date.isoformat())
+        total_rows_downloaded = sum(len(payload.get("frame", pd.DataFrame())) for payload in price_payloads.values())
+        add_timing("download_batch", "watchlist", download_started_at, total_rows_downloaded)
         progress_tracker.update(
             "Price download ready",
-            f"Received {len(full_price_payloads)} payloads and {total_rows_downloaded} total rows.",
+            f"Received {len(price_payloads)} payloads and {total_rows_downloaded} total rows.",
             advance=1,
         )
     except Exception as exc:
@@ -5018,29 +3445,10 @@ def main() -> None:
         st.stop()
 
     state_frames: dict[str, pd.DataFrame] = {}
-    baseline_state_frames: dict[str, pd.DataFrame] = {}
-    ml_bundles: dict[str, dict[str, Any]] = {}
     snapshots: list[TickerSnapshot] = []
     warnings: list[str] = []
-    macro_warning = macro_data.get("warning")
-    if macro_warning:
-        warnings.append(str(macro_warning))
-
-    cached_qqq_analysis: dict[str, Any] | None = None
-    if ML_TARGET_SYMBOL in watchlist:
-        progress_tracker.update(
-            "Building QQQ ML bundle",
-            "Training and selecting the walk-forward ML filter for QQQ.",
-            advance=0,
-        )
-        qqq_ml_started_at = time.perf_counter()
-        cached_qqq_analysis = load_cached_qqq_analysis(start_date.isoformat(), end_date.isoformat(), preset.name)
-        add_timing("ml_bundle", ML_TARGET_SYMBOL, qqq_ml_started_at, len(cached_qqq_analysis.get("state_frame", pd.DataFrame())))
-        progress_tracker.update(
-            "QQQ ML bundle ready",
-            f"Cached ML bundle mode: {cached_qqq_analysis.get('ml_bundle', {}).get('model_mode', 'rules_only')}.",
-            advance=1,
-        )
+    if macro_data.get("warning"):
+        warnings.append(str(macro_data["warning"]))
 
     for position, ticker in enumerate(watchlist, start=1):
         progress_tracker.update(
@@ -5049,24 +3457,14 @@ def main() -> None:
             advance=0,
         )
         compute_started_at = time.perf_counter()
-        payload = price_payloads[ticker]
-        price_frame = payload["frame"]
+        payload = price_payloads.get(ticker, {})
         warning = payload.get("warning")
         if warning:
             warnings.append(f"{ticker}: {warning}")
-        if price_frame.empty:
-            progress_tracker.update(
-                "Ticker skipped",
-                f"{ticker}: no usable price history was returned.",
-                advance=1,
-            )
-            continue
-        if ticker == ML_TARGET_SYMBOL and cached_qqq_analysis is not None:
-            analysis = cached_qqq_analysis
-        else:
-            analysis = analyze_symbol_state(ticker, payload, macro_data, preset)
+        analysis = analyze_symbol_state(ticker, payload, macro_data, preset, active_config)
         state_frame = analysis["state_frame"]
-        if state_frame.empty:
+        snapshot = analysis["snapshot"]
+        if state_frame.empty or snapshot is None:
             warnings.append(f"{ticker}: indicator stack could not build a usable state frame")
             progress_tracker.update(
                 "Ticker computation failed",
@@ -5074,22 +3472,27 @@ def main() -> None:
                 advance=1,
             )
             continue
-        baseline_state_frames[ticker] = analysis["baseline_state_frame"]
         state_frames[ticker] = state_frame
-        ml_bundles[ticker] = analysis["ml_bundle"]
-        snapshots.append(analysis["snapshot"])
+        snapshots.append(snapshot)
         add_timing("compute", ticker, compute_started_at, len(state_frame))
         progress_tracker.update(
             "Ticker computed",
-            f"{ticker}: {len(state_frame)} rows, latest state {analysis['snapshot'].state}, resolved {analysis['snapshot'].resolved_symbol}.",
+            f"{ticker}: {len(state_frame)} rows, latest state {snapshot.state}, config {active_config.config_hash()}.",
             advance=1,
         )
 
     watchlist_frame = build_watchlist_frame(snapshots)
-    render_header(macro_data, snapshots)
-    render_top_metrics(watchlist_frame, macro_data, preset)
+    render_header(macro_data, snapshots, optimizer_state)
+    render_top_metrics(watchlist_frame, macro_data, optimizer_state, active_config)
     render_warning_panel(warnings)
+    render_optimizer_status(optimizer_state)
+    render_best_configuration(optimizer_state.best_result if optimizer_state else None)
+    render_validation_matrix(optimizer_state.best_result if optimizer_state else None)
+    render_failing_cases(optimizer_state.best_result if optimizer_state else None)
     render_watchlist_summary(watchlist_frame)
+
+    with st.expander("Macro Context", expanded=False):
+        st.plotly_chart(build_macro_figure(macro_data, history_years), width="stretch", config={"displaylogo": False})
 
     diagnostics = build_diagnostics_frame(watchlist, price_payloads, macro_data)
     performance_frame = build_performance_frame(timing_rows)
@@ -5109,8 +3512,6 @@ def main() -> None:
     )
     selected_snapshot = snapshot_by_ticker[selected_ticker]
     selected_state_frame = state_frames[selected_ticker]
-    selected_baseline_state_frame = baseline_state_frames.get(selected_ticker, selected_state_frame)
-    selected_ml_bundle = ml_bundles.get(selected_ticker, {})
     progress_tracker.update(
         "Building replay summary",
         f"Preparing trade replay and summary cards for {selected_ticker}.",
@@ -5119,33 +3520,18 @@ def main() -> None:
     replay_started_at = time.perf_counter()
     event_frame, trade_frame, replay_summary = build_trade_replay_from_state_frame(selected_ticker, selected_state_frame, preset)
     add_timing("replay", selected_ticker, replay_started_at, len(event_frame))
+    chart_signal_frame = event_frame.loc[event_frame["Signal"].isin(["BUY", "SELL"])].copy() if not event_frame.empty else build_chart_signal_frame(selected_state_frame, preset)
     progress_tracker.update(
         "Replay summary ready",
         f"{selected_ticker}: {len(event_frame)} events, {int(replay_summary.get('closed_trades') or 0)} closed trades.",
         advance=1,
     )
-    progress_tracker.update(
-        "Preparing chart markers",
-        f"Building buy/sell markers for {selected_ticker} price context chart.",
-        advance=0,
-    )
-    chart_started_at = time.perf_counter()
-    chart_signal_frame = event_frame.loc[event_frame["Signal"].isin(["BUY", "SELL"])].copy() if not event_frame.empty else build_chart_signal_frame(selected_state_frame, preset)
-    add_timing("chart_signals", selected_ticker, chart_started_at, len(chart_signal_frame))
-    baseline_summary = build_trade_replay_from_state_frame(selected_ticker, selected_baseline_state_frame, preset)[2] if not selected_baseline_state_frame.empty else {}
     add_timing("total", "app_run", run_started_at)
     performance_frame = build_performance_frame(timing_rows)
-    progress_tracker.update(
-        "Chart markers ready",
-        f"{selected_ticker}: {len(chart_signal_frame)} markers prepared for display.",
-        advance=1,
-    )
     progress_tracker.finish(
         f"Dashboard run completed in {time.perf_counter() - run_started_at:.2f}s. Selected ticker: {selected_ticker}."
     )
-    comparison = selected_ml_bundle.get("comparison", {}).copy()
-    if comparison and "rule_summary" not in comparison:
-        comparison["rule_summary"] = baseline_summary
+
     render_ticker_panel(
         selected_ticker=selected_ticker,
         snapshot=selected_snapshot,
@@ -5154,9 +3540,7 @@ def main() -> None:
         event_frame=event_frame,
         trade_frame=trade_frame,
         replay_summary=replay_summary,
-        preset=preset,
-        comparison=comparison,
-        selection_frame=selected_ml_bundle.get("selection_frame", pd.DataFrame()),
+        active_config=active_config,
     )
     render_diagnostics(diagnostics, performance_frame)
 
@@ -5165,10 +3549,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=APP_TITLE)
     parser.add_argument("--self-test", action="store_true", help="Run built-in synthetic validation tests.")
     parser.add_argument("--benchmark", action="store_true", help="Run local performance benchmark.")
-    parser.add_argument("--ml-backtest", action="store_true", help="Run strict out-of-sample ML backtest.")
-    parser.add_argument("--symbol", default=ML_TARGET_SYMBOL, help="Ticker symbol for --ml-backtest.")
-    parser.add_argument("--start", default="2016-01-01", help="Start date for --ml-backtest in YYYY-MM-DD format.")
-    parser.add_argument("--end", default=date.today().isoformat(), help="End date for --ml-backtest in YYYY-MM-DD format.")
+    parser.add_argument("--rule-backtest", action="store_true", help="Run cost-aware rule backtest for one symbol.")
+    parser.add_argument("--optimize-report", action="store_true", help="Run optimizer search on the core validation matrix.")
+    parser.add_argument("--symbol", default="QQQ", help="Ticker symbol for --rule-backtest.")
+    parser.add_argument("--start", default="2016-01-01", help="Start date for --rule-backtest in YYYY-MM-DD format.")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date in YYYY-MM-DD format.")
+    parser.add_argument("--budget", choices=list(SEARCH_BUDGET_SPECS), default=DEFAULT_SEARCH_BUDGET, help="Search budget for --optimize-report.")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Emit machine-readable JSON output for CLI commands.")
     return parser
 
@@ -5179,6 +3565,8 @@ if __name__ == "__main__":
         raise SystemExit(run_self_tests_cli())
     if args.benchmark:
         raise SystemExit(run_benchmark_cli(json_output=args.json_output))
-    if args.ml_backtest:
-        raise SystemExit(run_ml_backtest_cli(args.symbol, args.start, args.end, json_output=args.json_output))
+    if args.rule_backtest:
+        raise SystemExit(run_rule_backtest_cli(args.symbol, args.start, args.end, json_output=args.json_output))
+    if args.optimize_report:
+        raise SystemExit(run_optimize_report_cli(args.end, args.budget, json_output=args.json_output))
     main()
